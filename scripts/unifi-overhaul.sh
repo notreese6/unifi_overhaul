@@ -1,30 +1,30 @@
 #!/bin/sh
-# vwire24.sh — force a 2.4 GHz UniFi wireless backhaul (vwire) alongside the 5 GHz one.
+# unifi-overhaul.sh — force a 2.4 GHz UniFi wireless backhaul (vwire) alongside the 5 GHz one.
 # Non-persistent: edits /tmp/system.cfg + applies via syswrapper. Reboot/controller-change reverts.
-#   ./vwire24.sh status|dryrun|apply|rollback|avail|help  [--role root|leaf|relay] [--channel N] [--with-ap]
+#   ./unifi-overhaul.sh status|dryrun|apply|rollback|avail|help  [--role root|leaf|relay] [--channel N] [--with-ap]
 # Role autodetected: ROOT (wired, adds a 2.4 downlink), LEAF (moves its uplink STA to 2.4),
 # RELAY (leaf that feeds other APs: moves uplink AND adds a 2.4 downlink). 'status' shows the chain.
 # Apply order: ROOT first, then RELAYS, then LEAVES.
 set -u
-CFG=/tmp/system.cfg; BAK=/tmp/system.cfg.vwire24.bak; NEW=/tmp/system.cfg.vwire24.new
-CH=1; ROLE=""; WITH_AP=0; FORCE=0; MAPARGS=""
+CFG=/tmp/system.cfg; BAK=/tmp/system.cfg.unifi-overhaul.bak; NEW=/tmp/system.cfg.unifi-overhaul.new
+CH=1; ROLE=""; WITH_AP=0; FORCE=0
 MODE="${1:-status}"; [ $# -gt 0 ] && shift
-# 'map' takes positional IPs (not flags); stash them so the flag parser doesn't choke
-case "$MODE" in map) MAPARGS="$*"; set -- ;; esac
+# the whole-mesh view moved to the python unifi-overhaul-map.py, which runs only on your workstation
+case "$MODE" in map) echo "[-] map moved to unifi-overhaul-map.py (python, run it on your workstation, not on a device)"; exit 2 ;; esac
 while [ $# -gt 0 ]; do case "$1" in
   --role) ROLE="$2"; shift 2 ;; --channel) CH="$2"; shift 2 ;; --with-ap) WITH_AP=1; shift ;;
   --force) FORCE=1; shift ;;
   *) echo "[-] unknown arg: $1"; exit 2 ;; esac; done
 
 usage(){ cat <<EOF
-vwire24.sh — add a 2.4 GHz UniFi wireless backhaul (vwire) alongside the 5 GHz one.
+unifi-overhaul.sh — add a 2.4 GHz UniFi wireless backhaul (vwire) alongside the 5 GHz one.
 Non-persistent: edits /tmp/system.cfg + applies the incremental diff. Reboot reverts.
 
-Usage: vwire24.sh [MODE] [options]
+Usage: unifi-overhaul.sh [MODE] [options]
   MODE (default: status):
     status     the chain (uplink / downlink / role), what's in use, backhaul state  (read-only)
-    map <targets>  ssh each device + print the WHOLE mesh tree; targets are [user@]ip
-               (run from your WORKSTATION; APs often use a different SSH user than the gateway)
+    (whole-mesh view: run unifi-overhaul-map.py on your WORKSTATION -- it finds the devices, probes each,
+     and shows per device whether the 2.4 GHz change is LIVE or REVERTED + the re-apply order)
     avail      show current uplink signal (live), then PROMPT to scan other bands     (scan can drop a weak link!)
     dryrun     show the exact config diff + the recommended apply command             (safe)
     apply      make the change (full wifi restart if a vap moves radios)
@@ -100,8 +100,11 @@ fdb_downstream(){   # vwire APs with a downstream MAC learned in the bridge -- s
     [ "${n:-0}" -gt 0 ] && echo "$dn"
   done
 }
-do_probe(){   # machine-readable one-device summary for 'map' (run remotely via ssh). No detect needed.
+do_probe(){   # machine-readable one-device summary for unifi-overhaul-map.py (run remotely via ssh). No detect needed.
   echo "H $(cat /proc/sys/kernel/hostname 2>/dev/null || echo unknown)"
+  # radio count lets unifi-overhaul-map.py skip a discovered switch instead of calling it a reverted root
+  w=$(iw phy 2>/dev/null | grep -c "^Wiphy"); [ "$w" -gt 0 ] || w=$(ls -d /sys/class/net/wifi[0-9] 2>/dev/null | wc -l)
+  echo "W $w"
   up=$(cat /var/run/system.uplink 2>/dev/null); st=$(cat /var/run/system.uplink_ifname 2>/dev/null)
   if [ "$up" = eth ] || [ -z "$st" ]; then echo "U WIRED - -"
   else
@@ -112,34 +115,6 @@ do_probe(){   # machine-readable one-device summary for 'map' (run remotely via 
   iwtree | awk '$1=="Interface"{i=$2} $1=="type"{ if($2=="AP" && i ~ /^vwireap/) print i }' | while read dn; do
     echo "A $(cat /sys/class/net/$dn/address 2>/dev/null) $(band_of "$(freq_of "$dn")")"
   done
-}
-do_map(){   # from your WORKSTATION: ssh each device, assemble the full chain by hostname.
-  # Args: [user@]ip ...  (bare ip => root@ip; APs often use a different SSH user than the gateway).
-  [ $# -ge 1 ] || { echo "[-] usage: vwire24.sh map [user@]<gateway-ip> [user@]<ap-ip> ...   (run from your workstation)"; return 2; }
-  t="/tmp/vwmap.$$"; : > "$t"
-  for tgt in "$@"; do
-    case "$tgt" in *@*) sshtgt="$tgt"; ip="${tgt#*@}" ;; *) sshtgt="root@$tgt"; ip="$tgt" ;; esac
-    echo "[*] probing $sshtgt ..." >&2; echo "D $ip" >> "$t"
-    ssh -o ConnectTimeout=6 -o StrictHostKeyChecking=accept-new "$sshtgt" 'sh -s __probe' < "$0" >> "$t" 2>/dev/null \
-      || echo "H $ip (unreachable -- wrong user? try user@ip)" >> "$t"
-  done
-  awk '
-    function pr(d, ind,   c,cd){
-      if (upband[d]=="-") printf "%s%s   (root, wired)\n", ind, host[d]
-      else printf "%s%s   <--[uplink %s%s]\n", ind, host[d], upband[d], (upsig[d]=="-"||upsig[d]==""?"":" "upsig[d]"dBm")
-      for(c=1;c<=n;c++){ cd=order[c]; if(cd!=d && parent[cd]==d) pr(cd, ind "    ") }
-    }
-    $1=="D"{dev=$2; devs[dev]=1}
-    $1=="H"{host[dev]=$2" ("dev")"; order[++n]=dev}
-    $1=="U"{up[dev]=$2; upband[dev]=$3; upsig[dev]=$4}
-    $1=="A"{owner[$2]=dev}
-    END{
-      for(c=1;c<=n;c++){ d=order[c]; parent[d]=(up[d]=="WIRED"?"ROOT":(up[d] in owner ? owner[up[d]] : "ORPHAN")) }
-      print ""; print "[*] mesh map (indented = uplinks to the line above; [band signal] is the uplink)"
-      for(c=1;c<=n;c++){ d=order[c]; if(parent[d]=="ROOT") pr(d, "") }
-      for(c=1;c<=n;c++){ d=order[c]; if(parent[d]=="ORPHAN") printf "  (?) %s -> uplink %s is on a device not probed (unreachable, or not listed)\n", host[d], up[d] }
-    }' "$t"
-  rm -f "$t"
 }
 detect(){
   [ -s "$CFG" ] || { log "[-] $CFG missing/empty"; exit 1; }
@@ -219,7 +194,7 @@ change_applied(){   # live ground-truth: is a 2.4GHz vwire in use on this device
 show_status(){
   host=$(cat /proc/sys/kernel/hostname 2>/dev/null)
   basemac=$(awk -F= '/^hwaddrbbase=/{print $2}' /proc/ubnthal/board 2>/dev/null)   # canonical device MAC
-  echo "==== vwire24 status: ${host:-?}  (role=$ROLE) ===="
+  echo "==== unifi-overhaul status: ${host:-?}  (role=$ROLE) ===="
   echo "[*] 2.4GHz backhaul in use here (live): $(change_applied)"
   echo ""
   echo "[*] Place in mesh chain   (uplink -> self -> downlink; [local: iface=name] = how neighbours see this end)"
@@ -341,9 +316,8 @@ show_avail(){
 
 
 case "$MODE" in -h|--help|help) usage; exit 0 ;; esac
-# map (workstation) and __probe (remote helper) don't touch /tmp/system.cfg -> handle before detect
+# __probe (remote helper for unifi-overhaul-map.py) doesn't touch /tmp/system.cfg -> handle before detect
 case "$MODE" in
-  map)     do_map $MAPARGS; exit $? ;;
   __probe) do_probe; exit 0 ;;
 esac
 detect
@@ -360,8 +334,8 @@ case "$MODE" in
     echo ""
     log "[*] dryrun only -- nothing changed.  autodetected role: $ROLE  (with-ap=$WITH_AP)"
     log "[*] APPLY this DETACHED -- your SSH will freeze ~20-30s during the full wifi restart:"
-    log "      nohup /tmp/vwire24.sh apply$wa > /tmp/vw.log 2>&1 &"
-    log "      # reconnect, then:  cat /tmp/vw.log ; /tmp/vwire24.sh status"
+    log "      nohup /tmp/unifi-overhaul.sh apply$wa > /tmp/vw.log 2>&1 &"
+    log "      # reconnect, then:  cat /tmp/vw.log ; /tmp/unifi-overhaul.sh status"
     log "[*] WHY detached: moving the uplink vap between radios forces a FULL wifi restart that"
     log "    drops your backhaul mid-command; nohup lets apply finish even if your SSH drops."
     log "[*] role is autodetected root/leaf/relay (see 'status'). RELAY auto-adds the 2.4 downlink,"
@@ -369,10 +343,10 @@ case "$MODE" in
   apply) cp -f "$CFG" "$BAK"; log "[+] backup: $BAK"; transform "$NEW"; mv -f "$NEW" "$CFG"
     log "[*] applying via syswrapper (a vap moving radios triggers a full wifi restart -- all wifi drops ~20-30s)..."
     apply_cfg
-    log "[+] apply issued. wait ~30s for wifi to settle, then run: /tmp/vwire24.sh status"
+    log "[+] apply issued. wait ~30s for wifi to settle, then run: /tmp/unifi-overhaul.sh status"
     [ "$ROLE" = leaf ] && log "[!] if this AP stays silent past ~1min, power-cycle it (reboot reverts to 5 GHz)" ;;
   rollback) if [ -f "$BAK" ]; then cp -f "$BAK" "$CFG"; log "[*] restoring backup + applying..."; apply_cfg
-    log "[+] rolled back. wait ~30s then run: /tmp/vwire24.sh status"
+    log "[+] rolled back. wait ~30s then run: /tmp/unifi-overhaul.sh status"
     else log "[-] no backup — reboot to revert"; fi ;;
-  *) log "[-] mode: status|map|dryrun|apply|rollback|avail|help"; exit 2 ;;
+  *) log "[-] mode: status|dryrun|apply|rollback|avail|help"; exit 2 ;;
 esac

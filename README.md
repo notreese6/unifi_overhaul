@@ -1,6 +1,6 @@
-# vwire24 — force a 2.4 GHz wireless backhaul on UniFi mesh APs
+# unifi-overhaul — force a 2.4 GHz wireless backhaul on UniFi mesh APs
 
-`vwire24.sh` switches a UniFi wireless mesh backhaul (Ubiquiti's hidden "vwire"
+`unifi-overhaul.sh` switches a UniFi wireless mesh backhaul (Ubiquiti's hidden "vwire"
 SSID) from 5 GHz to **2.4 GHz**, per device, at runtime. 2.4 GHz penetrates walls
 far better, so a distant AP that can't hold a solid 5 GHz uplink often gets a
 much stronger, more reliable link on 2.4 GHz — at the cost of lower throughput.
@@ -25,17 +25,17 @@ leaves**:
 ```sh
 # from your workstation (ideally wired to the gateway, so your session doesn't
 # ride the backhaul you're about to change):
-scp vwire24.sh root@<device-ip>:/tmp/
+scp unifi-overhaul.sh root@<device-ip>:/tmp/
 
 # on each device, in chain order:
-/tmp/vwire24.sh status        # shows your chain (uplink/downlink), role, + the apply command
-/tmp/vwire24.sh dryrun        # shows the config diff + the recommended apply line
-nohup /tmp/vwire24.sh apply [--with-ap] > /tmp/vw.log 2>&1 &   # see "Applying"
+/tmp/unifi-overhaul.sh status        # shows your chain (uplink/downlink), role, + the apply command
+/tmp/unifi-overhaul.sh dryrun        # shows the config diff + the recommended apply line
+nohup /tmp/unifi-overhaul.sh apply [--with-ap] > /tmp/vw.log 2>&1 &   # see "Applying"
 # reconnect after ~30s:
-cat /tmp/vw.log ; /tmp/vwire24.sh status
+cat /tmp/vw.log ; /tmp/unifi-overhaul.sh status
 ```
 
-To undo a device: `/tmp/vwire24.sh rollback`, or just **reboot / power-cycle it**
+To undo a device: `/tmp/unifi-overhaul.sh rollback`, or just **reboot / power-cycle it**
 (a reboot always restores the stock 5 GHz config).
 
 ---
@@ -92,36 +92,80 @@ A single device only knows **one hop each way** — its own uplink and the APs
 directly meshed to it (the controller is the only thing that holds the full tree).
 So there are two ways to see the topology:
 
-- **Per-device (`status`):** the `UP:` and `DOWN:` lines show your immediate
-  neighbours by name, and `DOWN:` names **which of your vwire APs** each downstream
-  is using and on what band, e.g.
-  `DOWN: <sta> (azure-wren) --> your vwireap2 [2.4GHz, cobalt-zebu]  -57dBm`.
-  Because names are stable mesh-wide, you can run `status` on each device and stitch
-  the chain together by matching names.
+- **Per-device (`status`):** shows the immediate neighbours as
+  `uplink -> self -> downlink`, with the negotiated PHY rate on each hop:
+  ```
+  [*] Place in mesh chain   (uplink -> self -> downlink; [local: iface=name] = how neighbours see this end)
+        uplink    proud-shrew (9a:..:c2)   [2.4GHz -60dBm  rx/tx 3.8G/2.0G]   [local: vwiresta9=happy-puma]
+        self      ap-hall (silver-ferret / 1c:..:fd)   [RELAY]
+        downlink  azure-wren (2a:..:ff)   [2.4GHz -59dBm  rx/tx 137M/206M]   [local: vwireap2=cobalt-zebu]
+  ```
+  Each line names the neighbour, and `[local: iface=name]` is the name **that
+  neighbour** sees this device by — so it lines up with the neighbour's own `status`:
+  the uplink's `downlink` line will show `happy-puma`, and the downlink's `uplink`
+  line will show `cobalt-zebu`. The **`self`** line is this device's stable identity —
+  its **hostname** plus the name of its base MAC (what `unifi-overhaul-map.py` keys on). Each vwire
+  interface has its own MAC/name, so the per-hop names differ from the base name;
+  that's expected. The `rx/tx` values are **PHY link rates** (negotiated, not
+  throughput) — useful for spotting a hop that negotiated low, not a speed test.
 
-- **Whole tree at once (`map`, run from your workstation):** SSHes to every device
-  you list, probes each, and prints the assembled tree by **hostname**:
+- **Whole tree at once (`unifi-overhaul-map.py`, a separate Python tool for your workstation):**
+  finds the devices, SSHes to each, probes it, and prints the assembled tree by
+  **hostname**. It is deliberately not part of `unifi-overhaul.sh`, so it can never be run on a
+  device (`unifi-overhaul.sh map` now just points here). Keep it next to `unifi-overhaul.sh`; it pipes
+  that script to each device to probe it.
   ```
-  vwire24.sh map <gateway-ip> <ap-ip> <ap-ip> ...
+  ./unifi-overhaul-map.py --discover --ap-user <device-ssh-user>      # find everything automatically
+  ./unifi-overhaul-map.py --discover --ap-user <user> --list          # just show what it found
+  ./unifi-overhaul-map.py [user@]<gateway-ip> [user@]<ap-ip> ...      # or name the devices yourself
   ```
+  **`--discover`** sends the Ubiquiti discovery broadcast (UDP 10001) and every UniFi device
+  on your LAN answers with its IP, MAC, hostname and model. Gateways (model codes `UX`,
+  `UDM`, `UDR`, `UCG`, `UXG`, `USG`, `UDW`…) are reached as `--gateway-user` (default
+  `root`); everything else as `--ap-user`, the controller's Device-SSH user (or set
+  `UNIFI_OVERHAUL_AP_USER`). A switch that answers is probed too, found to have no wifi radios,
+  and skipped. If nothing answers, try `--broadcast <subnet>.255`. Named targets are
+  `[user@]ip` (a bare IP means `root@`) and take precedence over discovered ones.
+  Exit status: `0` all live, `1` something to re-apply or unreachable, `3` nothing probed
+  (a missing input), so it can drive a cron job later.
   ```
-  == mesh map (indented = uplinks to the line above; [band signal] is the uplink) ==
-  gateway (192.168.1.1)   (root, wired)
-      ap-hall (192.168.1.20)   <--[uplink 2.4GHz -58dBm]
-          ap-far (192.168.1.21)   <--[uplink 2.4GHz -57dBm]
+  [*] mesh map (indented = uplinks to the line above; [band signal] is the uplink; [2.4: ...] = is the change live here)
+  gateway (192.168.1.1)   (root, wired)   [2.4: LIVE]
+      ap-hall (192.168.1.20)   <--[uplink 2.4GHz -58dBm]   [2.4: LIVE]
+          ap-far (192.168.1.21)   <--[uplink 5GHz -70dBm]   [2.4: REVERTED]
+
+  [*] 2.4 GHz backhaul live on 2 of 3 devices probed
+  [-] re-apply these, in this order, waiting ~30s (and re-running this) between each:
+        ap-far (192.168.1.21):  ssh admin@192.168.1.21 'cat > /tmp/unifi-overhaul.sh && ... apply ...' < ./unifi-overhaul.sh
   ```
+  **Run `unifi-overhaul-map.py` after a trip, reboot or controller change** to see which nodes reverted.
+  Each device gets a `[2.4: ...]` tag, judged from what is live on it right now:
+
+  | Tag | Meaning |
+  |---|---|
+  | `LIVE` | root: a 2.4 GHz vwire AP is up · leaf: its uplink is on 2.4 GHz · relay: both |
+  | `REVERTED` | back to stock 5 GHz — re-apply it |
+  | `PARTIAL` | a relay with only one side on 2.4 GHz — check `status`, `rollback`/reboot, then re-apply |
+  | `UNREACHABLE` | ssh failed — fix access and re-run before trusting the summary |
+
+  Any device that isn't `LIVE` is listed with a ready-to-paste re-apply command, **in
+  tree order** (root → relays → leaves), so you can work down the list. The command pipes
+  the script over ssh and runs `apply` detached, so the ~20–30s wifi restart doesn't cut it
+  off. A reverted relay gets `--with-ap`: if its children have already dropped, it would
+  otherwise autodetect as a leaf and never offer them the 2.4 GHz downlink.
   It joins the tree by matching each device's uplink BSSID to whichever device owns
-  that AP MAC. `map` is **read-only** and needs `ssh root@<ip>` to each device (the
-  controller's Device-SSH credentials); it pipes the script over SSH, so it doesn't
-  need to be pre-copied. Any device you *don't* list whose child points at it is
-  flagged `(?) … uplink … not listed`.
+  that AP MAC. `unifi-overhaul-map.py` is **read-only** (it prints re-apply commands, never runs
+  them) and needs SSH to each device (the controller's Device-SSH credentials); it pipes
+  the script over SSH, so it doesn't need to be pre-copied. A device it can't SSH into is
+  shown as `(x) … could not ssh in: <ssh's reason>`; one whose uplink is on a device that
+  wasn't probed is flagged `(?) … uplink … on a device not probed`.
 
 ---
 
 ## Applying (and why `nohup … &`)
 
 ```sh
-nohup /tmp/vwire24.sh apply [--with-ap] > /tmp/vw.log 2>&1 &
+nohup /tmp/unifi-overhaul.sh apply [--with-ap] > /tmp/vw.log 2>&1 &
 ```
 
 - **`nohup`** = "no hangup." The full wifi restart drops this AP's backhaul, so
@@ -134,7 +178,7 @@ nohup /tmp/vwire24.sh apply [--with-ap] > /tmp/vw.log 2>&1 &
   is lost.
 - **`&`** — background it, so your shell returns immediately instead of hanging.
 
-After ~30s, reconnect and `cat /tmp/vw.log ; /tmp/vwire24.sh status`.
+After ~30s, reconnect and `cat /tmp/vw.log ; /tmp/unifi-overhaul.sh status`.
 
 Run apply from a connection that does **not** ride the AP you're changing —
 ideally your workstation wired to the gateway. Then only that AP's SSH blips, not
@@ -155,8 +199,8 @@ after applying a leaf/relay:
   AP's 2.4 GHz vwire)
 - the AP still reachable, and downstream APs re-meshed
 
-Ignore two cosmetic things: `mca-mesh-band` can lag (the `iw link` read is truth),
-and the `rx/tx bitrate` numbers are driver misreports on 2.4 GHz.
+One cosmetic caveat: `mca-mesh-band` (mca's own label for the mesh band) can lag
+after a manual switch — the live `iw link` read the chain shows is the truth.
 
 ### Readable MAC names
 
@@ -225,7 +269,7 @@ permanent low-latency link, **wire the AP** (Ethernet backhaul) instead.
 
 | Situation | Fix |
 |---|---|
-| Change looks wrong, AP still reachable | `/tmp/vwire24.sh rollback` (restores this session's backup + re-applies) |
+| Change looks wrong, AP still reachable | `/tmp/unifi-overhaul.sh rollback` (restores this session's backup + re-applies) |
 | AP went silent after `apply` | wait ~1 min; if still dark, **power-cycle it** — it returns on 5 GHz |
 | AP frozen after `avail` scan | same — wait, then power-cycle |
 | Want everything back to stock | reboot the device, or change any setting in the UniFi app (forces a re-provision) |
@@ -240,7 +284,7 @@ escape hatch.
 | Mode | Reads/writes | What it does |
 |---|---|---|
 | `status` (default) | read-only | your chain (uplink/downlink/role) + live backhaul state |
-| `map <ips>` | read-only | ssh each device + print the whole mesh tree (run from your workstation) |
+| `unifi-overhaul-map.py [--discover] [user@ip…]` | read-only | separate workstation tool: find + ssh each device, print the whole mesh tree, `LIVE`/`REVERTED` per device, and the ordered re-apply commands |
 | `dryrun` | read-only | the exact config diff + the recommended (nohup) apply command |
 | `avail` | scans (gated) | current uplink live, then prompts to scan other bands |
 | `apply` | **writes+applies** | make the change (full wifi restart if a vap moves radios) |
@@ -327,10 +371,36 @@ keep it. If not, `rollback` (or reboot) and leave it on 5 GHz.
 
 ---
 
+## Glossary
+
+- **vwire** — Ubiquiti's hidden wireless-backhaul SSID (the AP-to-AP mesh link).
+- **BSS** (Basic Service Set) — one AP's network: the AP plus the devices associated
+  to it, identified by a **BSSID** (the AP's MAC). "vwire BSS" = the backhaul network
+  an AP broadcasts on a given radio. Each vwire AP (`vwireapN`) is one BSS.
+- **WDS** (Wireless Distribution System) — the method for bridging traffic between
+  APs *over Wi-Fi*. It uses **4-address** frames (you'll see `4addr: on`) that carry
+  the real source/dest **plus** both APs' MACs, so the hop bridges transparently.
+  A UniFi wireless mesh backhaul is a WDS link — hence `system.uplink=wds`.
+- **mca** — **Management Console Agent** (per the firmware's own package description
+  and `mcad` copyright string). The on-device UniFi agent (`mcad` = its daemon). It talks to the
+  controller (the "inform" protocol), **manages the wireless uplink/mesh** (which
+  AP/band to backhaul on, link monitoring, reconvergence), reports stats, and applies
+  pushed config. The `/var/run/system.*`, `uplink_wds`, and `system.mesh` files are
+  mca's runtime state. `mca-mesh-band` is just mca's *label* for the mesh band — it
+  does **not** control the link, and it goes stale after a manual switch (harmless).
+- **root / leaf / relay** — a device's place in the tree: root = wired gateway that
+  offers the backhaul; leaf = wireless AP with nothing meshed through it; relay = a
+  leaf that other APs mesh through.
+- **gateway_mac** (in `status`) — the mesh **root's** MAC (final L3 hop). On a
+  multi-hop leaf this is *not* the immediate wireless uplink (that's in the chain).
+
 ## Requirements & notes
 
-- Root SSH on each device; `iw`, `awk`, `sed`, `grep`, `md5sum` (all present on the
-  stock firmware); `busybox ash` shell (script is POSIX `sh`).
+- Root-level SSH on each device (the controller's Device-SSH login — note the
+  **gateway and APs may use different usernames**); `iw`, `awk`, `sed`, `grep`,
+  `md5sum` (all present on the stock firmware); `busybox ash` shell (POSIX `sh`).
+- `unifi-overhaul-map.py` runs on your workstation only: Python 3.8+ (standard library only)
+  and an `ssh` client. Keep it in the same directory as `unifi-overhaul.sh`.
 - `--channel` must match across every device (one radio = one channel; both ends
   of a hop must be on the same 2.4 GHz channel).
 - This is an unofficial modification of Ubiquiti firmware config. Use at your own
