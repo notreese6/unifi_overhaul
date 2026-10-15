@@ -1,0 +1,3 @@
+#!/bin/sh
+# Fake ping for the tests: answers at once, so a diagnostics run doesn't spend 10 s per ping.
+echo "fake ping $*"

@@ -1,0 +1,9 @@
+#!/bin/sh
+# Fake ssh for the tests: runs the requested remote command locally on the piped script.
+# Targets: *198.51.100.9 is unreachable, *slow* hangs (for the timeout path), anything else runs.
+for a in "$@"; do last="$a"; case "$a" in *@*) t="$a";; esac; done
+case "$t" in
+  *198.51.100.9) cat >/dev/null; echo "ssh: connect to host 198.51.100.9 port 22: No route to host" >&2; exit 255 ;;
+  *slow*)    cat >/dev/null; echo "partial output before the hang"; exec sleep 30 ;;
+esac
+exec sh -c "$last"

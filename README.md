@@ -96,28 +96,29 @@ So there are two ways to see the topology:
   `uplink -> self -> downlink`, with the negotiated PHY rate on each hop:
   ```
   [*] Place in mesh chain   (uplink -> self -> downlink; [local: iface=name] = how neighbours see this end)
-        uplink    proud-shrew (9a:..:c2)   [2.4GHz -60dBm  rx/tx 3.8G/2.0G]   [local: vwiresta9=happy-puma]
-        self      ap-hall (silver-ferret / 1c:..:fd)   [RELAY]
-        downlink  azure-wren (2a:..:ff)   [2.4GHz -59dBm  rx/tx 137M/206M]   [local: vwireap2=cobalt-zebu]
+        uplink    brave-otter (02:..:a1)   [2.4GHz -60dBm  rx/tx 3.8G/2.0G]   [local: vwiresta9=calm-heron]
+        self      ap-hall (sunny-finch / 02:..:b0)   [RELAY]
+        downlink  quiet-lynx (02:..:c3)   [2.4GHz -59dBm  rx/tx 137M/206M]   [local: vwireap2=noble-crane]
   ```
   Each line names the neighbour, and `[local: iface=name]` is the name **that
   neighbour** sees this device by — so it lines up with the neighbour's own `status`:
-  the uplink's `downlink` line will show `happy-puma`, and the downlink's `uplink`
-  line will show `cobalt-zebu`. The **`self`** line is this device's stable identity —
-  its **hostname** plus the name of its base MAC (what `unifi-overhaul-map.py` keys on). Each vwire
+  the uplink's `downlink` line will show `calm-heron`, and the downlink's `uplink`
+  line will show `noble-crane`. The **`self`** line is this device's stable identity —
+  its **hostname** plus the name of its base MAC (what `unifi-overhaul-client` keys on). Each vwire
   interface has its own MAC/name, so the per-hop names differ from the base name;
   that's expected. The `rx/tx` values are **PHY link rates** (negotiated, not
   throughput) — useful for spotting a hop that negotiated low, not a speed test.
 
-- **Whole tree at once (`unifi-overhaul-map.py`, a separate Python tool for your workstation):**
+- **Whole tree at once (`unifi-overhaul-client`, a separate Python tool for your workstation):**
   finds the devices, SSHes to each, probes it, and prints the assembled tree by
   **hostname**. It is deliberately not part of `unifi-overhaul.sh`, so it can never be run on a
-  device (`unifi-overhaul.sh map` now just points here). Keep it next to `unifi-overhaul.sh`; it pipes
-  that script to each device to probe it.
+  device (`unifi-overhaul.sh map` now just points here). It's the `unifi_overhaul` package in `src/`,
+  run from the repo root with `./unifi-overhaul-client` (or `PYTHONPATH=src python3 -m unifi_overhaul`), and
+  it pipes `scripts/unifi-overhaul.sh` to each device to probe it.
   ```
-  ./unifi-overhaul-map.py --discover --ap-user <device-ssh-user>      # find everything automatically
-  ./unifi-overhaul-map.py --discover --ap-user <user> --list          # just show what it found
-  ./unifi-overhaul-map.py [user@]<gateway-ip> [user@]<ap-ip> ...      # or name the devices yourself
+  ./unifi-overhaul-client --discover --ap-user <device-ssh-user>      # find everything automatically
+  ./unifi-overhaul-client --discover --ap-user <user> --list          # just show what it found
+  ./unifi-overhaul-client [user@]<gateway-ip> [user@]<ap-ip> ...      # or name the devices yourself
   ```
   **`--discover`** sends the Ubiquiti discovery broadcast (UDP 10001) and every UniFi device
   on your LAN answers with its IP, MAC, hostname and model. Gateways (model codes `UX`,
@@ -138,7 +139,7 @@ So there are two ways to see the topology:
   [-] re-apply these, in this order, waiting ~30s (and re-running this) between each:
         ap-far (192.168.1.21):  ssh admin@192.168.1.21 'cat > /tmp/unifi-overhaul.sh && ... apply ...' < ./unifi-overhaul.sh
   ```
-  **Run `unifi-overhaul-map.py` after a trip, reboot or controller change** to see which nodes reverted.
+  **Run `unifi-overhaul-client` after a trip, reboot or controller change** to see which nodes reverted.
   Each device gets a `[2.4: ...]` tag, judged from what is live on it right now:
 
   | Tag | Meaning |
@@ -154,11 +155,32 @@ So there are two ways to see the topology:
   off. A reverted relay gets `--with-ap`: if its children have already dropped, it would
   otherwise autodetect as a leaf and never offer them the 2.4 GHz downlink.
   It joins the tree by matching each device's uplink BSSID to whichever device owns
-  that AP MAC. `unifi-overhaul-map.py` is **read-only** (it prints re-apply commands, never runs
+  that AP MAC. `unifi-overhaul-client` is **read-only** (it prints re-apply commands, never runs
   them) and needs SSH to each device (the controller's Device-SSH credentials); it pipes
   the script over SSH, so it doesn't need to be pre-copied. A device it can't SSH into is
   shown as `(x) … could not ssh in: <ssh's reason>`; one whose uplink is on a device that
   wasn't probed is flagged `(?) … uplink … on a device not probed`.
+
+- **Everything at once, into one file (`unifi-overhaul-client --diagnostics`):** for
+  troubleshooting, instead of running commands device by device. It writes the mesh map
+  above plus every read-only fact from each device and from your workstation into one log:
+  ```
+  ./unifi-overhaul-client --discover --ap-user <user> --diagnostics             # logs/unifi-diagnostics-<timestamp>.log
+  ./unifi-overhaul-client --discover --ap-user <user> --diagnostics --log mesh.log
+  ```
+
+  | From | What it collects |
+  |---|---|
+  | each device | identity and firmware; memory, processes; `status`; `/tmp/system.cfg`, `running.cfg` vs `system.cfg`, the persisted `mgmt` config, uplink state files, past `unifi-overhaul`/`vwire24` commands from shell history; addresses, routes, bridge, ethernet link speed, ping to its gateway; `iw dev`/`reg`/`phy`, per-interface `info`/`link`/`station dump`/`survey dump`/cached `scan dump`, `wlanconfig list sta`, supplicant/hostapd status, `mca-dump`; `logread`, `dmesg`, the per-boot logs kept on flash (boot reason, minutes isolated, mesh events); on a UniFi OS console also `journalctl` and the Network app's own device/WiFi/country/event records |
+  | your workstation | OS, addresses, routes, DNS, its own wifi link (macOS `system_profiler`, Linux `iw`/`nmcli`), 10 pings to each device and to the internet |
+
+  Nothing it runs scans, restarts, or changes config; the device side is `unifi-overhaul.sh`'s
+  `__diag`, piped over ssh like the probe. Values that look like secrets (passphrases, PSKs,
+  passwords, auth keys, the controller's `x_` fields) are replaced with `<redacted>`, and the
+  run says how many. MACs, IPs and hostnames stay in, so the log is fine to share for
+  troubleshooting but shouldn't be committed (`logs/` is gitignored). An existing log is never overwritten. Expect a
+  minute or two per device; one that doesn't answer within 5 minutes is cut off, keeping what
+  it printed, and the run exits `1`.
 
 ---
 
@@ -284,7 +306,8 @@ escape hatch.
 | Mode | Reads/writes | What it does |
 |---|---|---|
 | `status` (default) | read-only | your chain (uplink/downlink/role) + live backhaul state |
-| `unifi-overhaul-map.py [--discover] [user@ip…]` | read-only | separate workstation tool: find + ssh each device, print the whole mesh tree, `LIVE`/`REVERTED` per device, and the ordered re-apply commands |
+| `unifi-overhaul-client [--discover] [user@ip…]` | read-only | separate workstation tool: find + ssh each device, print the whole mesh tree, `LIVE`/`REVERTED` per device, and the ordered re-apply commands |
+| `unifi-overhaul-client … --diagnostics [--log PATH]` | read-only | the same, plus every diagnostic from each device and the workstation in one log (secrets redacted) |
 | `dryrun` | read-only | the exact config diff + the recommended (nohup) apply command |
 | `avail` | scans (gated) | current uplink live, then prompts to scan other bands |
 | `apply` | **writes+applies** | make the change (full wifi restart if a vap moves radios) |
@@ -399,8 +422,11 @@ keep it. If not, `rollback` (or reboot) and leave it on 5 GHz.
 - Root-level SSH on each device (the controller's Device-SSH login — note the
   **gateway and APs may use different usernames**); `iw`, `awk`, `sed`, `grep`,
   `md5sum` (all present on the stock firmware); `busybox ash` shell (POSIX `sh`).
-- `unifi-overhaul-map.py` runs on your workstation only: Python 3.8+ (standard library only)
-  and an `ssh` client. Keep it in the same directory as `unifi-overhaul.sh`.
+- `unifi-overhaul-client` runs on your workstation only: Python 3.8+ (standard library only)
+  and an `ssh` client. Layout: `scripts/unifi-overhaul.sh` (on-device), `src/unifi_overhaul/`
+  (the workstation package), `src/tests/` (its tests), `logs/` (diagnostics output, gitignored).
+- Tests (standard library `unittest`, no install, ~2 s; fakes for `ssh`/`ping`/`iw` in `src/tests/fakebin`
+  run the real `unifi-overhaul.sh` locally): `python3 -m unittest discover -s src/tests -t src`
 - `--channel` must match across every device (one radio = one channel; both ends
   of a hop must be on the same 2.4 GHz channel).
 - This is an unofficial modification of Ubiquiti firmware config. Use at your own

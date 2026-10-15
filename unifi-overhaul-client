@@ -1,0 +1,14 @@
+#!/usr/bin/env python3
+"""
+Run the workstation client straight from a checkout: ./unifi-overhaul-client [options].
+"""
+
+import os
+import sys
+
+# The package lives in src/ next to this launcher, and isn't installed
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
+
+from unifi_overhaul.client import main  # noqa: E402  (needs the sys.path entry above)
+
+sys.exit(main())

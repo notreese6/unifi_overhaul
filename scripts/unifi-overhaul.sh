@@ -9,8 +9,8 @@ set -u
 CFG=/tmp/system.cfg; BAK=/tmp/system.cfg.unifi-overhaul.bak; NEW=/tmp/system.cfg.unifi-overhaul.new
 CH=1; ROLE=""; WITH_AP=0; FORCE=0
 MODE="${1:-status}"; [ $# -gt 0 ] && shift
-# the whole-mesh view moved to the python unifi-overhaul-map.py, which runs only on your workstation
-case "$MODE" in map) echo "[-] map moved to unifi-overhaul-map.py (python, run it on your workstation, not on a device)"; exit 2 ;; esac
+# the whole-mesh view lives in the python unifi-overhaul-client, which runs only on your workstation
+case "$MODE" in map) echo "[-] map moved to unifi-overhaul-client (python, run it on your workstation, not on a device)"; exit 2 ;; esac
 while [ $# -gt 0 ]; do case "$1" in
   --role) ROLE="$2"; shift 2 ;; --channel) CH="$2"; shift 2 ;; --with-ap) WITH_AP=1; shift ;;
   --force) FORCE=1; shift ;;
@@ -23,8 +23,9 @@ Non-persistent: edits /tmp/system.cfg + applies the incremental diff. Reboot rev
 Usage: unifi-overhaul.sh [MODE] [options]
   MODE (default: status):
     status     the chain (uplink / downlink / role), what's in use, backhaul state  (read-only)
-    (whole-mesh view: run unifi-overhaul-map.py on your WORKSTATION -- it finds the devices, probes each,
-     and shows per device whether the 2.4 GHz change is LIVE or REVERTED + the re-apply order)
+    (whole-mesh view: run unifi-overhaul-client on your WORKSTATION -- it finds the devices, probes each,
+     and shows per device whether the 2.4 GHz change is LIVE or REVERTED + the re-apply order;
+     its --diagnostics collects everything from every device into one log file)
     avail      show current uplink signal (live), then PROMPT to scan other bands     (scan can drop a weak link!)
     dryrun     show the exact config diff + the recommended apply command             (safe)
     apply      make the change (full wifi restart if a vap moves radios)
@@ -100,9 +101,9 @@ fdb_downstream(){   # vwire APs with a downstream MAC learned in the bridge -- s
     [ "${n:-0}" -gt 0 ] && echo "$dn"
   done
 }
-do_probe(){   # machine-readable one-device summary for unifi-overhaul-map.py (run remotely via ssh). No detect needed.
+do_probe(){   # machine-readable one-device summary for unifi-overhaul-client (run remotely via ssh). No detect needed.
   echo "H $(cat /proc/sys/kernel/hostname 2>/dev/null || echo unknown)"
-  # radio count lets unifi-overhaul-map.py skip a discovered switch instead of calling it a reverted root
+  # radio count lets unifi-overhaul-client skip a discovered switch instead of calling it a reverted root
   w=$(iw phy 2>/dev/null | grep -c "^Wiphy"); [ "$w" -gt 0 ] || w=$(ls -d /sys/class/net/wifi[0-9] 2>/dev/null | wc -l)
   echo "W $w"
   up=$(cat /var/run/system.uplink 2>/dev/null); st=$(cat /var/run/system.uplink_ifname 2>/dev/null)
@@ -115,6 +116,107 @@ do_probe(){   # machine-readable one-device summary for unifi-overhaul-map.py (r
   iwtree | awk '$1=="Interface"{i=$2} $1=="type"{ if($2=="AP" && i ~ /^vwireap/) print i }' | while read dn; do
     echo "A $(cat /sys/class/net/$dn/address 2>/dev/null) $(band_of "$(freq_of "$dn")")"
   done
+}
+
+# ---- __diag: every read-only fact worth having, for unifi-overhaul-client --diagnostics ----
+# Nothing here scans, restarts, or changes config. Secrets are redacted by the client before it writes the log.
+have(){ command -v "$1" >/dev/null 2>&1; }
+# each command gets /dev/null as stdin, so none can read from the ssh session or wait on it for input
+diag_run(){ printf '\n===== %s\n' "$1"; ( eval "$1" ) </dev/null 2>&1; printf -- '----- rc=%s\n' "$?"; }
+diag_section(){ printf '\n\n########## %s ##########\n' "$1"; }
+DIAG_EVENTS="configure_uplink|need_cfg_save|cfgmtd|STA_ASSOC|uplink-monitor|isolat|m3_dump|assert|recover|apply-config|provision|inform"
+diag_state_files(){
+  for f in /var/run/system.uplink /var/run/system.uplink_ifname /var/run/system.uplink.prev /var/run/uplink_eth \
+           /var/run/uplink_wds /var/run/uplink_bridge /var/run/mesh.status /var/run/need_cfg_save; do
+    [ -e "$f" ] && { echo "--- $f"; cat "$f"; }
+  done; return 0; }
+diag_shell_history(){   # the exact apply commands run before, e.g. which --channel
+  grep -hE "unifi-overhaul|vwire24" /tmp/log/ash_history /root/.ash_history /root/.bash_history \
+    "$HOME/.ash_history" "$HOME/.bash_history" 2>/dev/null | tail -n 80; }
+diag_ethernet(){
+  for p in /sys/class/net/eth*; do [ -e "$p" ] || continue; n=${p##*/}
+    echo "--- $n carrier=$(cat $p/carrier 2>/dev/null) speed=$(cat $p/speed 2>/dev/null) duplex=$(cat $p/duplex 2>/dev/null)"
+    have ethtool && ethtool "$n" 2>&1
+  done; return 0; }
+diag_ping_gateway(){
+  gw=$(ip route 2>/dev/null | awk '$1=="default"{print $3; exit}')
+  [ -n "$gw" ] || { echo "no default route"; return 1; }
+  ping -c 10 -W 2 "$gw"; }
+diag_supplicants(){   # uplink STA and vwire AP state as wpa_supplicant/hostapd see it (status only; no keys)
+  for d in /var/run/wpa_supplicant*; do [ -d "$d" ] || continue
+    for s in "$d"/*; do echo "--- wpa_cli -p $d -i ${s##*/} status"; wpa_cli -p "$d" -i "${s##*/}" status 2>&1; done
+  done
+  for d in /var/run/hostapd*; do [ -d "$d" ] || continue
+    for s in "$d"/*; do echo "--- hostapd_cli -p $d -i ${s##*/} status / all_sta"
+      hostapd_cli -p "$d" -i "${s##*/}" status 2>&1; hostapd_cli -p "$d" -i "${s##*/}" all_sta 2>&1; done
+  done; return 0; }
+diag_boot_history(){   # per-boot logs kept on flash: why each boot ended and the mesh events in it
+  for d in /tmp/log/boot/history/*/; do [ -d "$d" ] || continue
+    echo "=== $d  reason=$(cat "$d"boot_reason 2>/dev/null)  version=$(cat "$d"version 2>/dev/null)"
+    echo "    first: $(head -n 1 "$d"messages 2>/dev/null | cut -c1-24)   last: $(tail -n 1 "$d"messages 2>/dev/null | cut -c1-24)"
+    echo "    isolated ~$(( $(grep -c 'uplink addr is null' "$d"messages 2>/dev/null) * 15 / 60 )) min (15 s per 'uplink addr is null')"
+    grep -m3 -E "vwiresta[0-9]+ create wlandev" "$d"rc 2>/dev/null
+    grep -hiE "$DIAG_EVENTS" "$d"messages 2>/dev/null | cut -c1-260 | tail -n 80
+  done; return 0; }
+diag_controller(){   # the UniFi Network app's own view (gateway/console only), read-only, secret fields left out
+  m=$(command -v mongo || command -v mongosh) || { echo "no mongo client -- not a UniFi console, skipped"; return 0; }
+  for q in 'db.device.find({}, {name: 1, mac: 1, ip: 1, model: 1, version: 1, state: 1, adopted: 1, cfgversion: 1, uplink: 1, last_uplink: 1, radio_table: 1, mesh_sta_vap_enabled: 1}).forEach(printjson)' \
+           'db.wlanconf.find({}, {x_passphrase: 0, x_iapp_key: 0, private_preshared_keys: 0, sae_psk: 0}).forEach(printjson)' \
+           'db.setting.find({key: {$in: ["country", "connectivity", "mgmt", "radio_ai", "network_optimization"]}}, {x_ssh_password: 0, x_ssh_sha512passwd: 0, x_mgmt_key: 0}).forEach(printjson)' \
+           'db.site.find().forEach(printjson)' \
+           'db.event.find().sort({time: -1}).limit(150).forEach(printjson)' \
+           'db.alarm.find().sort({time: -1}).limit(50).forEach(printjson)'; do
+    echo "--- $q"; $TO "$m" --quiet --port 27117 ace --eval "$q" 2>&1
+  done; }
+do_diag(){
+  TO=""; have timeout && TO="timeout 60"
+  diag_section "identity"
+  for c in "date" "uptime" "cat /proc/sys/kernel/hostname" "uname -a" "cat /etc/version /usr/lib/version /etc/os-release" \
+           "cat /etc/board.info" "cat /proc/ubnthal/system.info" "cat /proc/ubnthal/board"; do diag_run "$c"; done
+  have ubnt-device-info && diag_run "ubnt-device-info summary"
+  have mca-cli-op && diag_run "$TO mca-cli-op info"
+  have dpkg && diag_run "dpkg -l | grep -iE 'unifi|ubnt|uos|mongo'"
+
+  diag_section "resources"
+  for c in "free" "df -h" "cat /proc/loadavg" "ps w 2>/dev/null || ps aux" "top -bn1 | head -n 40" "cat /proc/meminfo"; do diag_run "$c"; done
+
+  diag_section "unifi-overhaul state"
+  diag_run "detect && show_status"
+  diag_run "do_probe"
+  diag_run "ls -la /tmp/system.cfg* /tmp/running.cfg /tmp/default.cfg /tmp/vw.log"
+  have diff && diag_run "diff -u /tmp/running.cfg /tmp/system.cfg"
+  for c in "cat /tmp/vw.log" "diag_state_files" "diag_shell_history" "ls -la /etc/persistent/ /etc/persistent/cfg/" \
+           "cat /etc/persistent/cfg/mgmt" "cat /tmp/system.cfg"; do diag_run "$c"; done
+
+  diag_section "network"
+  for c in "ip addr" "ip route" "ip neigh" "brctl show" "bridge link" "bridge fdb show | grep -v permanent" \
+           "cat /proc/net/dev" "diag_ethernet" "diag_ping_gateway"; do diag_run "$c"; done
+
+  diag_section "wireless"
+  for c in "iw dev" "iw reg get" "iwconfig" "cat /proc/net/wireless" "diag_supplicants"; do diag_run "$c"; done
+  for i in $(iwtree | awk '$1=="Interface"{print $2}'); do
+    for c in info link "station dump" "survey dump" "scan dump"; do diag_run "iw dev $i $c"; done
+    have wlanconfig && diag_run "wlanconfig $i list sta"
+  done
+  for p in /sys/class/net/wifi[0-9]; do [ -e "$p" ] && have cfg80211tool || continue
+    for g in getCountry getCountryID; do diag_run "cfg80211tool ${p##*/} $g"; done
+  done
+  diag_run "iw phy"
+  have mca-dump && diag_run "$TO mca-dump"
+
+  diag_section "logs"
+  diag_run "ls -la /tmp/log /tmp/log/crash /tmp/log/boot/history"
+  diag_run "diag_boot_history"
+  have logread && diag_run "logread"
+  diag_run "dmesg | tail -n 500"
+  if have journalctl; then
+    for c in "journalctl --list-boots --no-pager | tail -n 20" "$TO journalctl -b --no-pager -n 2000" \
+             "$TO journalctl -b -1 --no-pager -n 500" "journalctl -k -b --no-pager -n 500" \
+             "systemctl --failed --no-pager"; do diag_run "$c"; done
+  fi
+
+  diag_section "controller (UniFi Network app)"
+  diag_run "diag_controller"
 }
 detect(){
   [ -s "$CFG" ] || { log "[-] $CFG missing/empty"; exit 1; }
@@ -316,9 +418,10 @@ show_avail(){
 
 
 case "$MODE" in -h|--help|help) usage; exit 0 ;; esac
-# __probe (remote helper for unifi-overhaul-map.py) doesn't touch /tmp/system.cfg -> handle before detect
+# __probe / __diag (remote helpers for unifi-overhaul-client) must run even when detect would fail -> handle before it
 case "$MODE" in
   __probe) do_probe; exit 0 ;;
+  __diag)  do_diag; exit 0 ;;
 esac
 detect
 [ "$MODE" = status ] || [ "$MODE" = avail ] || \

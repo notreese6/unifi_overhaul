@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-unifi-overhaul-map.py: find the UniFi gateway and APs, probe each one over ssh with unifi-overhaul.sh's __probe,
-and print the mesh tree with whether the 2.4 GHz backhaul change is live on each device.
+unifi_overhaul.client: find the UniFi gateway and APs, probe each one over ssh with unifi-overhaul.sh's __probe,
+and print the mesh tree with whether the 2.4 GHz backhaul change is live on each device. With --diagnostics it
+also runs unifi-overhaul.sh's read-only __diag on every device, plus checks of this machine, into one log file.
 
 Runs on your WORKSTATION only. The devices run unifi-overhaul.sh; this tool is never copied to them.
 """
@@ -11,8 +12,12 @@ from __future__ import annotations
 import argparse
 import ctypes
 import enum
+import hashlib
+import io
 import ipaddress
 import os
+import platform
+import re
 import shlex
 import shutil
 import socket
@@ -105,9 +110,26 @@ DISCOVERY_PROBE     = bytes(PacketHeader(version=DISCOVERY_VERSION, command=DISC
 DISCOVERY_SENDS     = 2
 SSH_CONNECT_TIMEOUT = 6
 BAND_24             = "2.4GHz"
+DIAG_TIMEOUT        = 300   # seconds for one device's __diag; mca-dump and the controller queries are the slow part
+LOCAL_TIMEOUT       = 90    # seconds for one check of this machine (system_profiler alone can take ~20)
+DEFAULT_LOG_NAME    = "unifi-diagnostics-%Y%m%d-%H%M%S.log"
+
+# This file is src/unifi_overhaul/client.py, so the repo root is three levels up
+REPO_ROOT      = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+DEFAULT_SCRIPT = os.path.join(REPO_ROOT, "scripts", "unifi-overhaul.sh")
+LOG_DIR        = os.path.join(REPO_ROOT, "logs")
+INTERNET_HOST       = "1.1.1.1"
+REDACTED            = "<redacted>"
 
 # Model-code prefixes of UniFi gateways / consoles; every other discovered device is treated as an AP
 GATEWAY_MODEL_PREFIXES = ["UX", "UDM", "UDR", "UCG", "UXG", "USG", "UDW"]
+
+# A name that holds a secret: credentials and keys, plus every controller x_ field (where it stores its secrets)
+SECRET_NAME = r"(?:x_\w*|[\w.\-]*(?:psk|passphrase|password|passwd|secret|authkey|auth_key|token|private_key|\.key\b)[\w.\-]*)"
+# system.cfg / mgmt style: name=value on its own line
+CFG_SECRET  = re.compile(rf"^(\s*{SECRET_NAME}\s*=)(.*)$", re.IGNORECASE | re.MULTILINE)
+# JSON style (mca-dump, the controller database): "name" : value, the value quoted or bare
+JSON_SECRET = re.compile(rf'("{SECRET_NAME}"\s*:\s*)("(?:[^"\\]|\\.)*"|[^,}}\s]+)', re.IGNORECASE)
 
 
 @dataclass
@@ -500,6 +522,176 @@ class Mesh:
         return ordered
 
 
+@dataclass
+class RedactedText:
+    """
+    Text with every secret-looking value replaced, and how many were replaced.
+    """
+
+    text:  str
+    count: int
+
+    @classmethod
+    def of(cls, text):
+        """
+        Redact config-style (name=value) and JSON-style ("name": value) secrets in a block of text.
+
+        Args:
+            text (str): the raw text.
+
+        Returns:
+            RedactedText: the redacted text and the number of values replaced.
+
+        Raises:
+            None
+        """
+
+        text, cfg_count  = CFG_SECRET.subn(rf"\1{REDACTED}", text)
+        text, json_count = JSON_SECRET.subn(rf'\1"{REDACTED}"', text)
+        return cls(text=text, count=cfg_count + json_count)
+
+
+@dataclass
+class RemoteRun:
+    """
+    The outcome of piping unifi-overhaul.sh to one device over ssh and running one of its modes.
+    """
+
+    target:       Target
+    returncode:   int
+    stdout:       str
+    stderr:       str
+    seconds:      float
+    is_timed_out: bool = False
+
+    @property
+    def error(self):
+        """
+        Why the run failed, in one line.
+
+        Args:
+            None
+
+        Returns:
+            str: the reason, or "" when ssh succeeded and the device printed something.
+
+        Raises:
+            None
+        """
+
+        if self.is_timed_out:
+            return f"timed out after {self.seconds:.0f}s (output so far is kept)"
+        if self.returncode == 0 and self.stdout.strip():
+            return ""
+        reason = self.stderr.strip().splitlines()
+        return reason[-1] if reason else f"ssh exited {self.returncode}"
+
+
+@dataclass
+class LocalCheck:
+    """
+    One diagnostic command run on this machine with /bin/sh, on the platforms it applies to.
+    """
+
+    title:     str
+    command:   str
+    platforms: list    # sys.platform prefixes, e.g. ["darwin", "linux"]
+
+    @property
+    def applies_here(self):
+        """
+        Whether this check is meant for the platform we are running on.
+
+        Args:
+            None
+
+        Returns:
+            bool: True when sys.platform starts with one of the check's platforms.
+
+        Raises:
+            None
+        """
+
+        return any(sys.platform.startswith(name) for name in self.platforms)
+
+
+POSIX = ["darwin", "linux"]
+
+LOCAL_CHECKS = [
+    LocalCheck("os",                        "uname -a; sw_vers 2>/dev/null; cat /etc/os-release 2>/dev/null", POSIX),
+    LocalCheck("addresses",                 "ip addr 2>/dev/null || ifconfig",                             POSIX),
+    LocalCheck("routes",                    "ip route 2>/dev/null || netstat -rn",                         POSIX),
+    LocalCheck("neighbours (arp)",          "ip neigh 2>/dev/null || arp -an",                             POSIX),
+    LocalCheck("dns",                       "cat /etc/resolv.conf; scutil --dns 2>/dev/null | head -n 60", POSIX),
+    LocalCheck("wifi (macOS)",              "system_profiler SPAirPortDataType",                           ["darwin"]),
+    LocalCheck("network ports (macOS)",     "networksetup -listallhardwareports",                          ["darwin"]),
+    LocalCheck("wifi links (iw)",
+               "iw dev; for i in $(iw dev | awk '$1==\"Interface\"{print $2}'); do "
+               "echo \"--- $i\"; iw dev \"$i\" link; iw dev \"$i\" station dump; done",                  ["linux"]),
+    LocalCheck("wifi (NetworkManager)",
+               "nmcli -f IN-USE,BSSID,SSID,CHAN,FREQ,RATE,SIGNAL,SECURITY dev wifi list",                 ["linux"]),
+]
+
+
+class DiagnosticLog:
+    """
+    The diagnostics log file: titled sections, with every body redacted before it is written.
+    """
+
+    def __init__(self, handle):
+        """
+        Wrap an open, writable text file.
+
+        Args:
+            handle (TextIO): the log file.
+
+        Returns:
+            None
+
+        Raises:
+            None
+        """
+
+        self.handle     = handle
+        self.redactions = 0
+
+    def section(self, title):
+        """
+        Start a new titled section.
+
+        Args:
+            title (str): the section title.
+
+        Returns:
+            None
+
+        Raises:
+            OSError: the log can't be written.
+        """
+
+        print(f"\n\n{'#' * 24} {title} {'#' * 24}", file=self.handle)
+        self.handle.flush()
+
+    def write(self, text):
+        """
+        Write a block of text, redacted.
+
+        Args:
+            text (str): the raw text.
+
+        Returns:
+            None
+
+        Raises:
+            OSError: the log can't be written.
+        """
+
+        redacted         = RedactedText.of(text)
+        self.redactions += redacted.count
+        print(redacted.text.rstrip("\n"), file=self.handle)
+        self.handle.flush()
+
+
 def mac_text(raw):
     """
     Format 6 raw bytes as a lowercase colon-separated MAC address.
@@ -592,9 +784,57 @@ def parse_probe(target, output):
     return dev
 
 
+def text_of(raw):
+    """
+    Decode captured process output, which is None when nothing was captured.
+
+    Args:
+        raw (bytes | None): the captured bytes.
+
+    Returns:
+        str: the decoded text, "" for None.
+
+    Raises:
+        None
+    """
+
+    return raw.decode("utf-8", "replace") if raw else ""
+
+
+def run_remote(target, script, mode, timeout=None):
+    """
+    ssh to one device and run one mode of unifi-overhaul.sh there by piping the script over stdin.
+
+    Args:
+        target (Target): the device.
+        script (bytes): the contents of unifi-overhaul.sh.
+        mode (str): the script mode to run, e.g. "__probe" or "__diag".
+        timeout (float | None): seconds before ssh is killed; None waits forever.
+
+    Returns:
+        RemoteRun: what the device printed, and whether ssh succeeded.
+
+    Raises:
+        OSError: the ssh binary can't be executed.
+    """
+
+    command = ["ssh", "-o", f"ConnectTimeout={SSH_CONNECT_TIMEOUT}", "-o", "StrictHostKeyChecking=accept-new",
+               target.ssh_target, f"sh -s {mode}"]
+    started = time.monotonic()
+
+    try:
+        result = subprocess.run(command, input=script, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired as expired:
+        return RemoteRun(target=target, returncode=-1, stdout=text_of(expired.stdout), stderr=text_of(expired.stderr),
+                         seconds=time.monotonic() - started, is_timed_out=True)
+
+    return RemoteRun(target=target, returncode=result.returncode, stdout=text_of(result.stdout),
+                     stderr=text_of(result.stderr), seconds=time.monotonic() - started)
+
+
 def probe(target, script):
     """
-    ssh to one device and run unifi-overhaul.sh's __probe there by piping the script over stdin.
+    ssh to one device and run unifi-overhaul.sh's __probe there.
 
     Args:
         target (Target): the device to probe.
@@ -608,14 +848,11 @@ def probe(target, script):
     """
 
     print(f"[*] probing {target.ssh_target} ...", file=sys.stderr)
-    command = ["ssh", "-o", f"ConnectTimeout={SSH_CONNECT_TIMEOUT}", "-o", "StrictHostKeyChecking=accept-new",
-               target.ssh_target, "sh -s __probe"]
-    result  = subprocess.run(command, input=script, capture_output=True)
+    run = run_remote(target, script, "__probe")
 
-    if result.returncode != 0 or not result.stdout.strip():
-        reason = result.stderr.decode("utf-8", "replace").strip().splitlines()
-        return Device(target=target, error=reason[-1] if reason else f"ssh exited {result.returncode}")
-    return parse_probe(target, result.stdout.decode("utf-8", "replace"))
+    if run.error:
+        return Device(target=target, error=run.error)
+    return parse_probe(target, run.stdout)
 
 
 def reapply_command(dev, mesh, script_path):
@@ -674,49 +911,52 @@ def tree_line(dev, depth, mesh):
     return f"{indent}{dev.label}   <--[uplink {dev.uplink_band}{signal}]   [2.4: {state.value}]"
 
 
-def print_report(mesh, script_path):
+def print_report(mesh, script_path, out=None):
     """
     Print the tree, the live summary, and the ordered re-apply list.
 
     Args:
         mesh (Mesh): the probed mesh.
         script_path (str): local path of unifi-overhaul.sh, used in the re-apply commands.
+        out (TextIO | None): where to print; None means stdout.
 
     Returns:
         ExitStatus: ALL_LIVE when every mesh device is live, else NEEDS_ACTION.
 
     Raises:
-        None
+        OSError: `out` can't be written.
     """
 
+    out     = out or sys.stdout
     ordered = mesh.tree_order()
     in_mesh = [dev for dev, _depth in ordered if mesh.state(dev) is not State.NO_WIFI]
     live    = [dev for dev in in_mesh if mesh.state(dev) is State.LIVE]
     dark    = [dev for dev in in_mesh if mesh.state(dev) is State.UNREACHABLE]
     todo    = [dev for dev in in_mesh if mesh.state(dev) in (State.REVERTED, State.PARTIAL)]
 
-    print("")
+    print("", file=out)
     print("[*] mesh map (indented = uplinks to the line above; [band signal] is the uplink; "
-          "[2.4: ...] = is the change live here)")
+          "[2.4: ...] = is the change live here)", file=out)
     for dev, depth in ordered:
-        print(tree_line(dev, depth, mesh))
+        print(tree_line(dev, depth, mesh), file=out)
 
-    print("")
-    print(f"[*] 2.4 GHz backhaul live on {len(live)} of {len(in_mesh)} mesh devices probed")
+    print("", file=out)
+    print(f"[*] 2.4 GHz backhaul live on {len(live)} of {len(in_mesh)} mesh devices probed", file=out)
     if dark:
-        print(f"[-] {len(dark)} device(s) could not be checked -- fix ssh access and re-run before trusting this")
+        print(f"[-] {len(dark)} device(s) could not be checked -- fix ssh access and re-run before trusting this",
+              file=out)
     if not todo:
         if not dark:
-            print("[+] nothing to re-apply")
+            print("[+] nothing to re-apply", file=out)
         return ExitStatus.ALL_LIVE if not dark else ExitStatus.NEEDS_ACTION
 
-    print("[-] re-apply these, in this order, waiting ~30s (and re-running this) between each:")
+    print("[-] re-apply these, in this order, waiting ~30s (and re-running this) between each:", file=out)
     for dev in todo:
         if mesh.state(dev) is State.PARTIAL:
             print(f"      {dev.label}:  PARTIAL (only one side of the relay is on 2.4) -- "
-                  f"check its status, rollback or reboot it, then re-apply")
+                  f"check its status, rollback or reboot it, then re-apply", file=out)
         else:
-            print(f"      {dev.label}:  {reapply_command(dev, mesh, script_path)}")
+            print(f"      {dev.label}:  {reapply_command(dev, mesh, script_path)}", file=out)
     return ExitStatus.NEEDS_ACTION
 
 
@@ -770,6 +1010,35 @@ def collect_targets(args):
     return targets
 
 
+def diagnostics_problems(args):
+    """
+    Check the --diagnostics / --log inputs: the log must be new, and its directory must exist and be writable.
+
+    Args:
+        args (argparse.Namespace): parsed arguments, with args.log already defaulted when --diagnostics is set.
+
+    Returns:
+        list[str]: one sentence per problem; empty when the diagnostics inputs are fine (or unused).
+
+    Raises:
+        None
+    """
+
+    if not args.diagnostics:
+        return ["--log only applies with --diagnostics"] if args.log else []
+    if args.list:
+        return ["--list connects to nothing, so it can't be combined with --diagnostics"]
+
+    folder = os.path.dirname(os.path.abspath(args.log))
+    if os.path.exists(args.log):
+        return [f"log {args.log!r} already exists -- pick another --log (an existing log is never overwritten)"]
+    if not os.path.isdir(folder):
+        return [f"log directory {folder!r} does not exist"]
+    if not os.access(folder, os.W_OK):
+        return [f"log directory {folder!r} is not writable"]
+    return []
+
+
 def input_problems(args):
     """
     Check every input this run depends on before doing any work.
@@ -801,6 +1070,7 @@ def input_problems(args):
     except ValueError:
         problems.append(f"--broadcast {args.broadcast!r} is not an IPv4 address")
 
+    problems += diagnostics_problems(args)
     return problems
 
 
@@ -843,30 +1113,32 @@ def report_no_targets():
     return ExitStatus.NOT_RUN
 
 
-def print_targets(targets):
+def print_targets(targets, out=None):
     """
     List what would be probed, without connecting to anything.
 
     Args:
         targets (list[Target]): the targets.
+        out (TextIO | None): where to print; None means stdout.
 
     Returns:
         ExitStatus: ALL_LIVE (nothing was checked, so nothing failed).
 
     Raises:
-        None
+        OSError: `out` can't be written.
     """
 
-    print(f"[*] {len(targets)} device(s) would be probed:")
+    out = out or sys.stdout
+    print(f"[*] {len(targets)} device(s) would be probed:", file=out)
     for target in targets:
         found = target.found
         if found is None:
-            print(f"      {target.ssh_target:28} (given on the command line)")
+            print(f"      {target.ssh_target:28} (given on the command line)", file=out)
             continue
         # Only the probe can tell an AP from a switch (radio count), so non-gateways stay unlabelled here
         kind = "gateway" if found.is_gateway else "AP or switch" if found.model_code else "unknown (no model sent)"
         print(f"      {target.ssh_target:28} {found.hostname or '-':18} {found.model_code or '-':10} "
-              f"{found.mac or '-':17} {kind}")
+              f"{found.mac or '-':17} {found.firmware or '-':24} {kind}", file=out)
     return ExitStatus.ALL_LIVE
 
 
@@ -884,11 +1156,11 @@ def build_parser():
         None
     """
 
-    here   = os.path.dirname(os.path.abspath(__file__))
     parser = argparse.ArgumentParser(
-        prog="unifi-overhaul-map.py",
+        prog="unifi-overhaul-client",
         description="Probe the UniFi mesh over ssh and show, per device, whether the unifi-overhaul 2.4 GHz "
-                    "backhaul change is LIVE or REVERTED, plus the ordered re-apply commands. "
+                    "backhaul change is LIVE or REVERTED, plus the ordered re-apply commands. With --diagnostics, "
+                    "also collect every read-only diagnostic from each device and this machine into one log. "
                     "Run on your workstation; exit 0 = all live, 1 = action needed, 3 = nothing probed.")
     parser.add_argument("targets", nargs="*", metavar="[user@]ip",
                         help="devices to probe; a bare ip means root@ip")
@@ -904,9 +1176,35 @@ def build_parser():
                         help="discovery broadcast address (default: 255.255.255.255)")
     parser.add_argument("--timeout", type=float, default=2.0,
                         help="seconds to wait for discovery replies (default: 2)")
-    parser.add_argument("--script", default=os.path.join(here, "unifi-overhaul.sh"),
-                        help="path to unifi-overhaul.sh (default: next to this tool)")
+    parser.add_argument("--script", default=DEFAULT_SCRIPT,
+                        help="path to unifi-overhaul.sh (default: scripts/unifi-overhaul.sh in this repo)")
+    parser.add_argument("--diagnostics", action="store_true",
+                        help="also run every read-only diagnostic on each device and on this machine, into --log "
+                             "(secrets redacted; takes a minute or two per device)")
+    parser.add_argument("--log", metavar="PATH",
+                        help=f"diagnostics log to create (default: logs/{DEFAULT_LOG_NAME.replace('%', '%%')} in this "
+                             f"repo); never overwrites an existing file")
     return parser
+
+
+def parse_arguments():
+    """
+    Parse the command line and fill in the default diagnostics log name, which carries the current time.
+
+    Args:
+        None
+
+    Returns:
+        argparse.Namespace: the parsed arguments.
+
+    Raises:
+        SystemExit: argparse rejected the command line (status 2) or printed --help (status 0).
+    """
+
+    args = build_parser().parse_args()
+    if args.diagnostics and not args.log:
+        args.log = os.path.join(LOG_DIR, time.strftime(DEFAULT_LOG_NAME))
+    return args
 
 
 def probe_all(targets, script_path):
@@ -929,9 +1227,223 @@ def probe_all(targets, script_path):
     return [probe(target, script) for target in targets]
 
 
+def local_checks_for(targets):
+    """
+    The checks to run on this machine: the platform's own, then a ping to every device and to the internet.
+
+    Args:
+        targets (list[Target]): the devices being diagnosed.
+
+    Returns:
+        list[LocalCheck]: the checks that apply on this platform, in run order.
+
+    Raises:
+        None
+    """
+
+    checks = [check for check in LOCAL_CHECKS if check.applies_here]
+
+    for host in [target.ip for target in targets] + [INTERNET_HOST]:
+        ping = LocalCheck(f"ping {host}", f"ping -c 10 {shlex.quote(host)}", POSIX)
+        checks.append(ping)
+
+    return [check for check in checks if check.applies_here]
+
+
+def run_local_check(check):
+    """
+    Run one check on this machine and capture everything it prints.
+
+    Args:
+        check (LocalCheck): the check.
+
+    Returns:
+        str: stdout and stderr together, then the exit status (or a note that it timed out).
+
+    Raises:
+        None
+    """
+
+    try:
+        # stderr folded into stdout so an error shows up next to the output it interrupted
+        result = subprocess.run(["/bin/sh", "-c", check.command], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, timeout=LOCAL_TIMEOUT)
+    except subprocess.TimeoutExpired as expired:
+        return f"{text_of(expired.stdout)}\n----- timed out after {LOCAL_TIMEOUT}s"
+    except OSError as error:
+        return f"----- could not run: {error}"
+    return f"{text_of(result.stdout)}\n----- rc={result.returncode}"
+
+
+def log_header(log, args, targets, script):
+    """
+    Write what this run was: when, from where, against what, and with which unifi-overhaul.sh.
+
+    Args:
+        log (DiagnosticLog): the log.
+        args (argparse.Namespace): parsed arguments.
+        targets (list[Target]): the devices being diagnosed.
+        script (bytes): the contents of unifi-overhaul.sh piped to each device.
+
+    Returns:
+        None
+
+    Raises:
+        OSError: the log can't be written.
+    """
+
+    log.section("unifi-overhaul-client --diagnostics")
+    log.write(f"started:   {time.strftime('%Y-%m-%d %H:%M:%S %Z')}  ({time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())})\n"
+              f"command:   {shlex.join(sys.argv)}\n"
+              f"client:    {platform.node()}  {platform.platform()}  python {platform.python_version()}\n"
+              f"script:    {args.script}  sha256 {hashlib.sha256(script).hexdigest()[:16]}\n"
+              f"devices:   {len(targets)}\n"
+              f"note:      values that look like passwords, keys or x_ secrets are replaced with {REDACTED}")
+    log.section("devices")
+    listing = io.StringIO()
+    print_targets(targets, out=listing)
+    log.write(listing.getvalue())
+
+
+def log_local_checks(log, targets):
+    """
+    Run every check of this machine (addresses, routes, its own wifi link, pings) into the log.
+
+    Args:
+        log (DiagnosticLog): the log.
+        targets (list[Target]): the devices being diagnosed, to ping.
+
+    Returns:
+        None
+
+    Raises:
+        OSError: the log can't be written.
+    """
+
+    print("[*] checking this machine (wifi, routes, pings) ...", file=sys.stderr)
+    log.section(f"this machine ({platform.node()})")
+    for check in local_checks_for(targets):
+        log.write(f"\n===== {check.title}: {check.command}")
+        log.write(run_local_check(check))
+
+
+def log_mesh_report(log, targets, script_path):
+    """
+    Probe every device and write the same mesh map the plain run prints.
+
+    Args:
+        log (DiagnosticLog): the log.
+        targets (list[Target]): the devices.
+        script_path (str): local path of unifi-overhaul.sh.
+
+    Returns:
+        ExitStatus: the mesh report's status (ALL_LIVE or NEEDS_ACTION).
+
+    Raises:
+        OSError: the log or unifi-overhaul.sh can't be accessed, or ssh can't be executed.
+    """
+
+    log.section("mesh map")
+    report = io.StringIO()
+    status = print_report(Mesh(probe_all(targets, script_path)), script_path, out=report)
+    log.write(report.getvalue())
+    print(report.getvalue(), end="")
+    return status
+
+
+def log_device_diagnostics(log, targets, script):
+    """
+    Run unifi-overhaul.sh's __diag on each device in turn and write everything it prints.
+
+    Args:
+        log (DiagnosticLog): the log.
+        targets (list[Target]): the devices.
+        script (bytes): the contents of unifi-overhaul.sh.
+
+    Returns:
+        list[RemoteRun]: the runs that failed or timed out (empty when every device answered in full).
+
+    Raises:
+        OSError: the log can't be written, or ssh can't be executed.
+    """
+
+    failed = []
+
+    for target in targets:
+        print(f"[*] collecting diagnostics from {target.ssh_target} (up to {DIAG_TIMEOUT}s) ...", file=sys.stderr)
+        run = run_remote(target, script, "__diag", timeout=DIAG_TIMEOUT)
+
+        log.section(f"device {target.ssh_target}   ({run.seconds:.0f}s, ssh rc={run.returncode})")
+        if run.error:
+            log.write(f"[-] diagnostics incomplete: {run.error}")
+            failed.append(run)
+        log.write(run.stdout)
+        if run.stderr.strip():
+            log.write(f"\n===== ssh stderr\n{run.stderr}")
+
+    return failed
+
+
+def report_diagnostics(log_path, log, failed):
+    """
+    Tell the operator where the log is, how much was redacted, and which devices didn't answer in full.
+
+    Args:
+        log_path (str): the log file written.
+        log (DiagnosticLog): the finished log.
+        failed (list[RemoteRun]): the device runs that failed or timed out.
+
+    Returns:
+        None
+
+    Raises:
+        None
+    """
+
+    for run in failed:
+        print(f"[-] {run.target.ssh_target}: diagnostics incomplete -- {run.error}", file=sys.stderr)
+    print(f"[+] diagnostics written to {os.path.abspath(log_path)} "
+          f"({os.path.getsize(log_path) // 1024} KiB, {log.redactions} secret value(s) redacted)", file=sys.stderr)
+    print("[*] it still holds MACs, IPs and hostnames -- fine to share for troubleshooting, but don't commit it",
+          file=sys.stderr)
+
+
+def run_diagnostics(args, targets):
+    """
+    Write the full diagnostics log: header, this machine, the mesh map, then every device's __diag output.
+
+    Args:
+        args (argparse.Namespace): parsed arguments (log path, script path).
+        targets (list[Target]): the devices to diagnose.
+
+    Returns:
+        ExitStatus: NEEDS_ACTION when any device couldn't be diagnosed in full, else the mesh map's status.
+
+    Raises:
+        OSError: the log can't be created or written, unifi-overhaul.sh can't be read, or ssh can't be executed.
+    """
+
+    with open(args.script, "rb") as handle:
+        script = handle.read()
+
+    print(f"[*] writing diagnostics to {args.log}", file=sys.stderr)
+    # "x" creates the file and fails if it appeared since the inputs were checked, so nothing is ever overwritten
+    with open(args.log, "x", encoding="utf-8") as handle:
+        log = DiagnosticLog(handle)
+        log_header(log, args, targets, script)
+        log_local_checks(log, targets)
+        status = log_mesh_report(log, targets, args.script)
+        failed = log_device_diagnostics(log, targets, script)
+        log.section("end")
+        log.write(f"finished:  {time.strftime('%Y-%m-%d %H:%M:%S %Z')}   redacted values: {log.redactions}")
+
+    report_diagnostics(args.log, log, failed)
+    return ExitStatus.NEEDS_ACTION if failed else status
+
+
 def main():
     """
-    Validate inputs, gather targets, probe them, and report.
+    Validate inputs, gather targets, then probe and report (or collect full diagnostics).
 
     Args:
         None
@@ -940,10 +1452,10 @@ def main():
         int: an ExitStatus value.
 
     Raises:
-        OSError: discovery, reading unifi-overhaul.sh, or running ssh failed.
+        OSError: discovery, reading unifi-overhaul.sh, writing the log, or running ssh failed.
     """
 
-    args     = build_parser().parse_args()
+    args     = parse_arguments()
     problems = input_problems(args)
     if problems:
         return report_problems(problems)
@@ -953,6 +1465,8 @@ def main():
         return report_no_targets()
     if args.list:
         return print_targets(targets)
+    if args.diagnostics:
+        return run_diagnostics(args, targets)
 
     return print_report(Mesh(probe_all(targets, args.script)), args.script)
 

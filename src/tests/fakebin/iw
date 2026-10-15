@@ -1,0 +1,6 @@
+#!/bin/sh
+# Fake iw for the tests: one 2.4 GHz uplink interface, so the per-interface diagnostics loop runs.
+case "$*" in
+  dev) printf 'phy#0\n\tInterface vwiresta8\n\t\ttype managed\n\t\tchannel 1 (2412 MHz)\n' ;;
+  *)   echo "fake iw $*" ;;
+esac
