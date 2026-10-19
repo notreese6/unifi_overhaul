@@ -54,7 +54,7 @@ Nothing to build or install. You need:
 | Path | What it is | Runs on |
 |---|---|---|
 | `scripts/unifi-overhaul.sh` | The change itself: `status`, `dryrun`, `apply`, `rollback` | each UniFi device |
-| `./unifi-overhaul-client` | Mesh map, `--apply`, and full diagnostics, over ssh | your computer |
+| `./unifi-overhaul-client` | Mesh map, `--apply`, gateway self-heal, and full diagnostics, over ssh | your computer |
 | `mesh.example.ini` | Template for describing your mesh | copy to `~/.config/unifi-overhaul/` |
 | `src/unifi_overhaul/` | The client's Python package (standard library only, Python 3.8+) | your computer |
 | `src/tests/` | Its tests | your computer |
@@ -243,13 +243,41 @@ to the one your mesh is on.
 |---|---|---|
 | `apply`, then the AP's uplink reconnects | **Saved:** the AP writes its running config to flash whenever its uplink comes up | n/a |
 | AP reboot | Keeps the change, if it was saved | n/a |
-| Gateway reboot or power cut | Keep theirs, and look for a 2.4 GHz parent | **Loses it.** Re-apply right away, or the APs stay isolated |
-| Any controller provision: a settings change, firmware update, re-adoption, plugging an AP into Ethernet | **Back to stock 5 GHz**, and that gets saved | Back to stock |
+| Gateway reboot or power cut | Keep theirs, and look for a 2.4 GHz parent | **Loses it.** Re-apply right away (or let [self-heal](#gateway-self-heal) do it), or the APs stay isolated |
+| Any controller provision: a settings change, firmware update, re-adoption, plugging an AP into Ethernet | **Back to stock 5 GHz**, and that gets saved | Back to stock (self-heal re-applies it within 5 minutes) |
 
 The dangerous case is a provision on an AP whose **stock 5 GHz link can't reach its parent**,
 which is exactly the kind of AP this project is for. It drops off the network immediately and
 can't be reached over ssh to fix. Avoid site-wide UniFi changes while the mesh is applied.
 Change per-device settings only on APs that can still connect on 5 GHz.
+
+### Gateway self-heal
+
+The gateway is the one device that forgets the change on every reboot, and it's always reachable,
+so it can fix itself:
+
+```sh
+./unifi-overhaul-client --install-self-heal     # asks first; reads the gateway and channel from mesh.ini
+./unifi-overhaul-client --remove-self-heal
+```
+
+This installs a systemd timer on the gateway that re-applies the root 90 seconds after every boot
+and every 5 minutes after that. Because `apply` changes nothing when the 2.4 GHz network is already
+there, a run that finds nothing wrong does nothing. It also keeps a copy of root's `authorized_keys`
+and puts back any key a firmware update removes.
+
+| On the gateway | What it is |
+|---|---|
+| `/data/unifi-overhaul/` | A copy of the script, the channel, and the key snapshot. `/data` survives firmware updates |
+| `/etc/systemd/system/unifi-overhaul-heal.{service,timer}` | The timer. **A firmware update probably removes these**, so run `--install-self-heal` again afterwards |
+
+The map shows its state on the gateway's line (`[self-heal: active]`). Check it after the
+gateway's next reboot to confirm the timer survived. Its log: `journalctl -u unifi-overhaul-heal`.
+`--remove-self-heal` deletes exactly the files above. If anything else has ended up in
+`/data/unifi-overhaul/`, it leaves the folder and says so.
+
+Self-heal only fixes the gateway. APs that a provision put back on stock 5 GHz still need
+`--apply`, and one out of 5 GHz range still needs the recovery below.
 
 ---
 
@@ -258,7 +286,7 @@ Change per-device settings only on APs that can still connect on 5 GHz.
 | Situation | Fix |
 |---|---|
 | Anything shows `REVERTED`, or the map flags a wrong parent | `./unifi-overhaul-client --apply` |
-| APs isolated after a power cut | `--apply`: it fixes the gateway first, then waits for the APs to come back on 2.4 GHz |
+| APs isolated after a power cut | Wait 2 minutes if self-heal is installed; otherwise `--apply`, which fixes the gateway first and then waits for the APs to come back on 2.4 GHz |
 | An AP stays unreachable (provisioned back to 5 GHz, out of 5 GHz range) | `--apply` stops at it. Move it next to its parent, or wire it temporarily, run `--apply`, then put it back |
 | You want stock back on one device | `rollback` (only from the same boot as the first `apply`), or force a re-provision of that device from the UniFi app |
 
@@ -269,6 +297,7 @@ Change per-device settings only on APs that can still connect on 5 GHz.
 ```sh
 ./unifi-overhaul-client                               # mesh map for the devices in mesh.ini, plus warnings
 ./unifi-overhaul-client --apply [--yes]               # make the mesh match mesh.ini
+./unifi-overhaul-client --install-self-heal           # let the gateway re-apply itself (--remove-self-heal undoes)
 ./unifi-overhaul-client [user@]ip ...                 # mesh map for these devices instead
 ./unifi-overhaul-client --discover --ap-user USER     # find the devices instead of listing them
 ./unifi-overhaul-client ... --list                    # show what would be probed, connect to nothing
@@ -282,7 +311,7 @@ answers for every device it has adopted, since APs don't always answer the broad
 Gateways are reached as `--gateway-user` (default `root`) and everything else as `--ap-user` (or
 `$UNIFI_OVERHAUL_AP_USER`).
 
-Only `--apply` changes anything; every other mode only reads.
+Only `--apply` and the self-heal options change anything; every other mode only reads.
 
 | Tag | Meaning |
 |---|---|

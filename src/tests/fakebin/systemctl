@@ -1,0 +1,11 @@
+#!/bin/sh
+# Fake systemctl for the tests: records each call in $FAKE_SYSTEMCTL_LOG and reports a timer active once it's
+# been enabled. Without FAKE_SYSTEMCTL_LOG it does nothing, so it can never touch the real system.
+[ -n "${FAKE_SYSTEMCTL_LOG:-}" ] || exit 0
+echo "$*" >> "$FAKE_SYSTEMCTL_LOG"
+case "$1" in
+  is-active) if [ -f "$FAKE_SYSTEMCTL_LOG.enabled" ]; then echo active; exit 0; fi; echo inactive; exit 3 ;;
+  enable)    touch "$FAKE_SYSTEMCTL_LOG.enabled" ;;
+  disable)   rm -f "${FAKE_SYSTEMCTL_LOG:?}.enabled" ;;
+esac
+exit 0

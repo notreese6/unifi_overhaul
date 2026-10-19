@@ -293,6 +293,7 @@ class Device:
     uplink_signal: str = ""
     aps:           list = field(default_factory=list)  # (mac, band) of each vwire AP it offers
     wifi_radios:   int = -1         # -1 = the probe didn't say (an older unifi-overhaul.sh)
+    self_heal:     str = ""         # gateway self-heal timer: active / inactive / absent; "" = not reported
     error:         str = ""
 
     @property
@@ -809,6 +810,8 @@ def parse_probe(target, output):
             dev.aps.append((fields[1].lower(), fields[2]))
         elif kind == "W" and len(fields) >= 2 and fields[1].isdigit():
             dev.wifi_radios = int(fields[1])
+        elif kind == "S" and len(fields) >= 2:
+            dev.self_heal = fields[1]
 
     # The uplink BSSID has to match the AP MACs case-for-case to join the tree
     dev.uplink = dev.uplink.lower() if dev.uplink not in ("WIRED", "NONE") else dev.uplink
@@ -976,7 +979,11 @@ def tree_line(dev, depth, mesh):
     if mesh.is_orphan(dev):
         return f"  (?) {dev.label} -> uplink {dev.uplink} is on a device not probed   [2.4: {state.value}]"
     if dev.is_root:
-        return f"{indent}{dev.label}   (root, wired)   [2.4: {state.value}]"
+        heal = ""
+        if dev.self_heal:
+            shown = "not installed" if dev.self_heal == "absent" else dev.self_heal
+            heal  = f"   [self-heal: {shown}]"
+        return f"{indent}{dev.label}   (root, wired)   [2.4: {state.value}]{heal}"
 
     signal = f" {dev.uplink_signal}dBm" if dev.uplink_signal not in ("", "-") else ""
     return f"{indent}{dev.label}   <--[uplink {dev.uplink_band}{signal}]   [2.4: {state.value}]"

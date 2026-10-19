@@ -7,9 +7,14 @@
 # RELAY (leaf that feeds other APs: moves uplink AND adds a 2.4 downlink). 'status' shows the chain.
 # Apply order: ROOT first, then RELAYS, then LEAVES.
 set -u
-# the two overrides exist for the tests, which run this script against a fixture config and a fake syswrapper
+# The UNIFI_OVERHAUL_* overrides exist for the tests, which run this script against temporary files and fakes
 CFG=${UNIFI_OVERHAUL_CFG:-/tmp/system.cfg}; BAK=$CFG.unifi-overhaul.bak; NEW=$CFG.unifi-overhaul.new
 SYSWRAPPER=${UNIFI_OVERHAUL_SYSWRAPPER:-/usr/bin/syswrapper.sh}
+# Self-heal on the gateway; /data survives firmware updates on UniFi OS. Overridable for the tests too.
+HEAL_DIR=${UNIFI_OVERHAUL_DATA:-/data/unifi-overhaul}; UNIT_DIR=${UNIFI_OVERHAUL_UNITS:-/etc/systemd/system}
+AUTH_KEYS=${UNIFI_OVERHAUL_AUTH_KEYS:-/root/.ssh/authorized_keys}; UNIT=unifi-overhaul-heal
+# The only files self-heal creates in HEAL_DIR; removal deletes exactly these and nothing else
+HEAL_FILES="unifi-overhaul.sh settings authorized_keys"
 CH=1; ROLE=""; WITH_AP=0; FORCE=0
 MODE="${1:-status}"; [ $# -gt 0 ] && shift
 # the whole-mesh view lives in the python unifi-overhaul-client, which runs only on your workstation
@@ -111,6 +116,7 @@ do_probe(){   # machine-readable one-device summary for unifi-overhaul-client (r
   # radio count lets unifi-overhaul-client skip a discovered switch instead of calling it a reverted root
   w=$(iw phy 2>/dev/null | grep -c "^Wiphy"); [ "$w" -gt 0 ] || w=$(ls -d /sys/class/net/wifi[0-9] 2>/dev/null | wc -l)
   echo "W $w"
+  echo "S $(heal_state)"
   up=$(cat /var/run/system.uplink 2>/dev/null); st=$(cat /var/run/system.uplink_ifname 2>/dev/null)
   if [ "$up" = eth ] || [ -z "$st" ]; then echo "U WIRED - -"
   else
@@ -179,6 +185,40 @@ do_devices(){
   m=$(command -v mongo || command -v mongosh) || { echo "E no mongo client -- not a UniFi console"; return 0; }
   $m --quiet --port 27117 ace --eval 'db.device.find({adopted: true}, {ip: 1, mac: 1, type: 1, model: 1, name: 1}).forEach(function (d) { print(["D", d.ip, d.mac, d.type, d.model, d.name].join("\t")); })' 2>&1
 }
+heal_state(){   # the gateway self-heal timer: active, inactive (installed but stopped), or absent
+  { have systemctl && [ -f "$UNIT_DIR/$UNIT.timer" ]; } || { echo absent; return 0; }
+  systemctl is-active "$UNIT.timer" 2>/dev/null || true; }
+do_install(){   # gateway only: re-apply the root's 2.4 GHz backhaul after every boot and controller provision
+  { have systemctl && [ -d "$(dirname "$HEAL_DIR")" ]; } || { log "[-] no systemd or no $(dirname "$HEAL_DIR") here -- self-heal is for the UniFi OS gateway only"; exit 1; }
+  if [ "$(cat /var/run/system.uplink 2>/dev/null)" = wds ]; then log "[-] this device uplinks wirelessly -- self-heal is for the wired gateway only"; exit 1; fi
+  [ -f "$HEAL_DIR/unifi-overhaul.sh" ] || { log "[-] $HEAL_DIR/unifi-overhaul.sh missing -- install with unifi-overhaul-client --install-self-heal"; exit 1; }
+  echo "CHANNEL=$CH" > "$HEAL_DIR/settings"
+  # Snapshot root's keys, so a firmware update that wipes them doesn't end key-based ssh for good
+  if [ -s "$AUTH_KEYS" ]; then cp -f "$AUTH_KEYS" "$HEAL_DIR/authorized_keys"; fi
+  printf '%s\n' "[Unit]" "Description=unifi-overhaul: keep the 2.4 GHz mesh backhaul applied on this gateway" "" \
+    "[Service]" "Type=oneshot" "ExecStart=/bin/sh $HEAL_DIR/unifi-overhaul.sh __heal" > "$UNIT_DIR/$UNIT.service"
+  printf '%s\n' "[Unit]" "Description=unifi-overhaul: re-check the 2.4 GHz backhaul after boot and every 5 minutes" "" \
+    "[Timer]" "OnBootSec=90s" "OnUnitActiveSec=5min" "" "[Install]" "WantedBy=timers.target" > "$UNIT_DIR/$UNIT.timer"
+  { systemctl daemon-reload && systemctl enable --now "$UNIT.timer"; } || { log "[-] couldn't enable $UNIT.timer"; exit 1; }
+  log "[+] self-heal installed ($UNIT.timer: $(heal_state)): 90s after boot, then every 5 min. Log: journalctl -u $UNIT"
+}
+# Undo do_install: exact file names only, ${VAR:?} so an empty path aborts instead of deleting, and rmdir
+# (which refuses a non-empty directory) rather than a recursive delete
+do_remove(){
+  if have systemctl; then systemctl disable --now "$UNIT.timer" >/dev/null 2>&1; fi
+  rm -f "${UNIT_DIR:?}/${UNIT:?}.service" "${UNIT_DIR:?}/${UNIT:?}.timer"
+  if have systemctl; then systemctl daemon-reload; fi
+  for f in $HEAL_FILES; do rm -f "${HEAL_DIR:?}/${f:?}"; done
+  if [ -d "$HEAL_DIR" ] && ! rmdir "${HEAL_DIR:?}" 2>/dev/null; then
+    log "[-] left $HEAL_DIR in place: it holds files self-heal didn't create"; fi
+  log "[+] self-heal removed"
+}
+heal_keys(){   # put back any snapshot key that's missing from root's authorized_keys
+  [ -s "$HEAL_DIR/authorized_keys" ] || return 0
+  mkdir -p "$(dirname "$AUTH_KEYS")"; chmod 700 "$(dirname "$AUTH_KEYS")"; touch "$AUTH_KEYS"; chmod 600 "$AUTH_KEYS"
+  while IFS= read -r key; do
+    if [ -n "$key" ] && ! grep -qxF "$key" "$AUTH_KEYS"; then echo "$key" >> "$AUTH_KEYS"; log "[+] restored an ssh key"; fi
+  done < "$HEAL_DIR/authorized_keys"; return 0; }
 do_diag(){
   TO=""; have timeout && TO="timeout 60"
   diag_section "identity"
@@ -437,11 +477,17 @@ show_avail(){
 
 
 case "$MODE" in -h|--help|help) usage; exit 0 ;; esac
-# __probe / __diag / __devices (remote helpers for unifi-overhaul-client) must run even when detect would fail -> handle before it
+# __probe / __diag / __devices / self-heal (remote helpers for unifi-overhaul-client) must run even when detect would fail -> handle before it
 case "$MODE" in
-  __probe) do_probe; exit 0 ;;
-  __diag)  do_diag; exit 0 ;;
+  __probe)   do_probe; exit 0 ;;
+  __diag)    do_diag; exit 0 ;;
   __devices) do_devices; exit 0 ;;
+  __install) do_install; exit 0 ;;
+  __remove)  do_remove; exit 0 ;;
+  # The self-heal timer: restore keys, then fall through to an idempotent root apply below
+  __heal)    heal_keys
+             [ -s "$CFG" ] || { log "[*] $CFG not there yet -- checking again next run"; exit 0; }
+             c=$(sed -n 's/^CHANNEL=//p' "$HEAL_DIR/settings" 2>/dev/null); CH=${c:-$CH}; ROLE=root; MODE=apply ;;
 esac
 detect
 [ "$MODE" = status ] || [ "$MODE" = avail ] || \
@@ -450,10 +496,10 @@ case "$MODE" in
   status) show_status ;;
   avail)  show_avail ;;
   dryrun) transform "$NEW"
-    if same_file "$CFG" "$NEW"; then rm -f "$NEW"; log "[+] already applied (role=$ROLE ch=$CH) -- apply would change nothing"; exit 0; fi
+    if same_file "$CFG" "$NEW"; then rm -f "${NEW:?}"; log "[+] already applied (role=$ROLE ch=$CH) -- apply would change nothing"; exit 0; fi
     if command -v diff >/dev/null 2>&1; then diff -u "$CFG" "$NEW"
     else log "ADDED:"; grep -vxF -f "$CFG" "$NEW"; log "REMOVED:"; grep -vxF -f "$NEW" "$CFG"; fi
-    rm -f "$NEW"
+    rm -f "${NEW:?}"
     wa=""; [ "$WITH_AP" = 1 ] && wa=" --with-ap"
     echo ""
     log "[*] dryrun only -- nothing changed.  autodetected role: $ROLE  (with-ap=$WITH_AP)"
@@ -465,7 +511,7 @@ case "$MODE" in
     log "[*] role is autodetected from what's connected now (see 'status'); on a relay pass --with-ap,"
     log "    since an AP below it that's disconnected right now makes it look like a leaf." ;;
   apply) transform "$NEW"
-    if same_file "$CFG" "$NEW"; then rm -f "$NEW"; log "[+] already applied (role=$ROLE ch=$CH) -- nothing to change"; exit 0; fi
+    if same_file "$CFG" "$NEW"; then rm -f "${NEW:?}"; log "[+] already applied (role=$ROLE ch=$CH) -- nothing to change"; exit 0; fi
     # Keep the first pre-apply config of this boot, so rollback still reaches stock after a second apply
     [ -f "$BAK" ] || cp -f "$CFG" "$BAK"; log "[+] backup: $BAK"; mv -f "$NEW" "$CFG"
     log "[*] applying via syswrapper (a vap moving radios triggers a full wifi restart -- all wifi drops ~20-30s)..."

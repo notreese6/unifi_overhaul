@@ -1,6 +1,6 @@
 """
 unifi_overhaul.cli: the command line — parse and validate arguments, pick the devices, and dispatch to the mesh
-map, --diagnostics, or --apply.
+map, --diagnostics, --apply, or the gateway self-heal.
 """
 
 from __future__ import annotations
@@ -13,13 +13,32 @@ import sys
 import time
 
 from unifi_overhaul import apply as mesh_apply
-from unifi_overhaul import client
+from unifi_overhaul import client, selfheal
 from unifi_overhaul.topology import Topology, TopologyError, default_mesh_path
+
+
+def change_modes(args):
+    """
+    The options given that change devices (rather than only read them).
+
+    Args:
+        args (argparse.Namespace): parsed arguments.
+
+    Returns:
+        list[str]: the flags given, among --apply, --install-self-heal and --remove-self-heal.
+
+    Raises:
+        None
+    """
+
+    flags = [("--apply", args.apply), ("--install-self-heal", args.install_self_heal),
+             ("--remove-self-heal", args.remove_self_heal)]
+    return [flag for flag, is_given in flags if is_given]
 
 
 def uses_mesh_file(args):
     """
-    Whether the devices come from mesh.ini: always for --apply, and for a plain run given no devices.
+    Whether the devices come from mesh.ini: always for a change, and for a plain run given no devices.
 
     Args:
         args (argparse.Namespace): parsed arguments.
@@ -31,7 +50,7 @@ def uses_mesh_file(args):
         None
     """
 
-    return args.apply or (not args.targets and not args.discover)
+    return bool(change_modes(args)) or (not args.targets and not args.discover)
 
 
 def read_script(path):
@@ -185,30 +204,34 @@ def diagnostics_problems(args):
     return []
 
 
-def apply_problems(args):
+def change_problems(args):
     """
-    Check the --apply / --yes inputs: --apply works from mesh.ini alone, and needs a way to confirm.
+    Check the inputs of a change (--apply or a self-heal option): one at a time, devices from mesh.ini alone, and
+    a way to confirm.
 
     Args:
         args (argparse.Namespace): parsed arguments.
 
     Returns:
-        list[str]: one sentence per problem; empty when the apply inputs are fine (or unused).
+        list[str]: one sentence per problem; empty when the change inputs are fine (or there's no change).
 
     Raises:
         None
     """
 
-    if not args.apply:
-        return ["--yes only applies with --apply"] if args.yes else []
+    modes = change_modes(args)
+    if not modes:
+        return ["--yes only applies with --apply or a self-heal option"] if args.yes else []
 
     problems = []
+    if len(modes) > 1:
+        problems.append(f"pick one of {', '.join(modes)}")
     if args.targets or args.discover:
-        problems.append("--apply takes its devices from mesh.ini; drop the device list and --discover")
+        problems.append(f"{modes[0]} takes its devices from mesh.ini; drop the device list and --discover")
     if args.list or args.diagnostics:
-        problems.append("--apply can't be combined with --list or --diagnostics")
+        problems.append(f"{modes[0]} can't be combined with --list or --diagnostics")
     if not args.yes and not sys.stdin.isatty():
-        problems.append("--apply asks before changing anything; with no terminal to ask on, pass --yes")
+        problems.append(f"{modes[0]} asks before changing anything; with no terminal to ask on, pass --yes")
     return problems
 
 
@@ -228,7 +251,7 @@ def mesh_file_problems(args):
 
     if not uses_mesh_file(args):
         return []
-    if not os.path.isfile(args.mesh) and not args.apply:
+    if not os.path.isfile(args.mesh) and not change_modes(args):
         return [f"nothing to probe -- give [user@]ip targets, --discover, or describe your mesh in {args.mesh} "
                 f"(copy mesh.example.ini)"]
     try:
@@ -269,7 +292,7 @@ def input_problems(args):
 
     problems += mesh_file_problems(args)
     problems += diagnostics_problems(args)
-    problems += apply_problems(args)
+    problems += change_problems(args)
     return problems
 
 
@@ -340,8 +363,13 @@ def build_parser():
                              "(default: %(default)s)")
     parser.add_argument("--apply", action="store_true",
                         help="fix every device that doesn't match mesh.ini, parents first, checking each one")
+    parser.add_argument("--install-self-heal", action="store_true",
+                        help="on mesh.ini's gateway, re-apply 2.4 GHz after every reboot and provision (a systemd "
+                             "timer; re-run after a firmware update)")
+    parser.add_argument("--remove-self-heal", action="store_true",
+                        help="stop the gateway self-heal and delete exactly the files it installed")
     parser.add_argument("--yes", action="store_true",
-                        help="with --apply, don't ask before making changes")
+                        help="with --apply or a self-heal option, don't ask before making changes")
     parser.add_argument("--discover", action="store_true",
                         help="also find devices with the Ubiquiti discovery broadcast (UDP 10001)")
     parser.add_argument("--list", action="store_true",
@@ -404,6 +432,25 @@ def run_apply(args, topology):
     return mesh_apply.run(topology, runner, is_confirmed=args.yes)
 
 
+def run_self_heal(args, topology):
+    """
+    Install or remove the self-heal timer on mesh.ini's gateway.
+
+    Args:
+        args (argparse.Namespace): parsed arguments (which option, script path, --yes).
+        topology (Topology): the loaded mesh.ini.
+
+    Returns:
+        client.ExitStatus: the outcome.
+
+    Raises:
+        OSError: unifi-overhaul.sh can't be read, or ssh can't be executed.
+    """
+
+    change = selfheal.install if args.install_self_heal else selfheal.remove
+    return change(topology, read_script(args.script), mesh_apply.ask, is_confirmed=args.yes)
+
+
 def run_map(args, targets, topology):
     """
     Probe the devices, print the mesh map, and flag anything that differs from mesh.ini.
@@ -433,7 +480,7 @@ def run_map(args, targets, topology):
 
 def main():
     """
-    Validate inputs, gather devices, then show the map, collect diagnostics, or apply.
+    Validate inputs, gather devices, then show the map, collect diagnostics, apply, or install/remove self-heal.
 
     Args:
         None
@@ -453,6 +500,8 @@ def main():
     topology = Topology.load(args.mesh) if uses_mesh_file(args) else None
     if args.apply:
         return run_apply(args, topology)
+    if args.install_self_heal or args.remove_self_heal:
+        return run_self_heal(args, topology)
 
     targets = collect_targets(args, topology)
     if not targets:
