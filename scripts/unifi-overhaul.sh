@@ -7,7 +7,9 @@
 # RELAY (leaf that feeds other APs: moves uplink AND adds a 2.4 downlink). 'status' shows the chain.
 # Apply order: ROOT first, then RELAYS, then LEAVES.
 set -u
-CFG=/tmp/system.cfg; BAK=/tmp/system.cfg.unifi-overhaul.bak; NEW=/tmp/system.cfg.unifi-overhaul.new
+# the two overrides exist for the tests, which run this script against a fixture config and a fake syswrapper
+CFG=${UNIFI_OVERHAUL_CFG:-/tmp/system.cfg}; BAK=$CFG.unifi-overhaul.bak; NEW=$CFG.unifi-overhaul.new
+SYSWRAPPER=${UNIFI_OVERHAUL_SYSWRAPPER:-/usr/bin/syswrapper.sh}
 CH=1; ROLE=""; WITH_AP=0; FORCE=0
 MODE="${1:-status}"; [ $# -gt 0 ] && shift
 # the whole-mesh view lives in the python unifi-overhaul-client, which runs only on your workstation
@@ -274,17 +276,24 @@ move_sta(){ out=$1
   v=$(free_virtual 1 "$out")
   printf 'radio.1.virtual.%s.devname=%s\nradio.1.virtual.%s.status=enabled\nradio.1.virtual.%s.mode=managed\n' "$v" "$STA_DEV" "$v" "$v" >> "$out"
 }
+has_24_downlink(){   # $1=config: is a vwire backhaul AP already on the 2.4 GHz radio?
+  for i in $(awk -F. '$1=="wireless"{print $2}' "$1"|sort -nu); do
+    [ "$(val wireless.$i.vwire "$1")" = enabled ] && [ "$(val wireless.$i.usage "$1")" = downlink ] && \
+      [ "$(val wireless.$i.parent "$1")" = wifi0 ] && return 0
+  done; return 1; }
+# Only adds what's missing, so running it on an already-applied config changes nothing (no second AP)
 transform(){ out=$1; cp -f "$CFG" "$out"
   set_kv radio.1.channel "$CH" "$out"
   # root & relay OFFER a 2.4 downlink (clone AP); leaf & relay MOVE their uplink STA to 2.4
-  { [ "$ROLE" = root ] || [ "$ROLE" = relay ] || [ "$WITH_AP" = 1 ]; } && clone_ap "$out"
-  { [ "$ROLE" = leaf ] || [ "$ROLE" = relay ]; } && move_sta "$out"; }
+  if { [ "$ROLE" = root ] || [ "$ROLE" = relay ] || [ "$WITH_AP" = 1 ]; } && ! has_24_downlink "$out"; then clone_ap "$out"; fi
+  if { [ "$ROLE" = leaf ] || [ "$ROLE" = relay ]; } && [ "$(val "wireless.$STA_IDX.parent" "$out")" != wifi0 ]; then move_sta "$out"; fi; }
+same_file(){ if have cmp; then cmp -s "$1" "$2"; else diff "$1" "$2" >/dev/null 2>&1; fi; }
 apply_cfg(){
   # syswrapper's own apply path: fast-apply when it can, and an AUTOMATIC full wifi restart for
   # changes fast-apply can't do (e.g. moving a vap between radios -- 'parent unhandled'). 'nopersist'
   # skips the immediate flash write; an AP still saves its running config once its uplink reconnects.
   # A full restart briefly drops ALL wifi (~20-30s).
-  /usr/bin/syswrapper.sh apply-config "$CFG" nopersist; }
+  "$SYSWRAPPER" apply-config "$CFG" nopersist; }
 
 change_applied(){   # live ground-truth: is a 2.4GHz vwire in use on this device?
   if [ "$ROLE" = root ]; then
@@ -434,6 +443,7 @@ case "$MODE" in
   status) show_status ;;
   avail)  show_avail ;;
   dryrun) transform "$NEW"
+    if same_file "$CFG" "$NEW"; then rm -f "$NEW"; log "[+] already applied (role=$ROLE ch=$CH) -- apply would change nothing"; exit 0; fi
     if command -v diff >/dev/null 2>&1; then diff -u "$CFG" "$NEW"
     else log "ADDED:"; grep -vxF -f "$CFG" "$NEW"; log "REMOVED:"; grep -vxF -f "$NEW" "$CFG"; fi
     rm -f "$NEW"
@@ -445,13 +455,16 @@ case "$MODE" in
     log "      # reconnect, then:  cat /tmp/vw.log ; /tmp/unifi-overhaul.sh status"
     log "[*] WHY detached: moving the uplink vap between radios forces a FULL wifi restart that"
     log "    drops your backhaul mid-command; nohup lets apply finish even if your SSH drops."
-    log "[*] role is autodetected root/leaf/relay (see 'status'). RELAY auto-adds the 2.4 downlink,"
-    log "    so plain 'apply' is right -- only add --with-ap if downstream APs aren't connected yet." ;;
-  apply) cp -f "$CFG" "$BAK"; log "[+] backup: $BAK"; transform "$NEW"; mv -f "$NEW" "$CFG"
+    log "[*] role is autodetected from what's connected now (see 'status'); on a relay pass --with-ap,"
+    log "    since an AP below it that's disconnected right now makes it look like a leaf." ;;
+  apply) transform "$NEW"
+    if same_file "$CFG" "$NEW"; then rm -f "$NEW"; log "[+] already applied (role=$ROLE ch=$CH) -- nothing to change"; exit 0; fi
+    # Keep the first pre-apply config of this boot, so rollback still reaches stock after a second apply
+    [ -f "$BAK" ] || cp -f "$CFG" "$BAK"; log "[+] backup: $BAK"; mv -f "$NEW" "$CFG"
     log "[*] applying via syswrapper (a vap moving radios triggers a full wifi restart -- all wifi drops ~20-30s)..."
     apply_cfg
     log "[+] apply issued. wait ~30s for wifi to settle, then run: /tmp/unifi-overhaul.sh status"
-    [ "$ROLE" = leaf ] && log "[-] if this AP stays silent past ~1min, power-cycle it; if it still can't connect, see the README's Recovery" ;;
+    if [ "$ROLE" = leaf ]; then log "[-] if this AP stays silent past ~1min, power-cycle it; if it still can't connect, see the README's Recovery"; fi ;;
   rollback) if [ -f "$BAK" ]; then cp -f "$BAK" "$CFG"; log "[*] restoring backup + applying..."; apply_cfg
     log "[+] rolled back. wait ~30s then run: /tmp/unifi-overhaul.sh status"
     else log "[-] no backup from this boot -- force a re-provision of this device from the UniFi app to restore stock"; fi ;;

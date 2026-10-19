@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 unifi_overhaul.client: find the UniFi gateway and APs, probe each one over ssh with unifi-overhaul.sh's __probe,
 and print the mesh tree with whether the 2.4 GHz backhaul change is live on each device. With --diagnostics it
@@ -9,7 +8,6 @@ Runs on your WORKSTATION only. The devices run unifi-overhaul.sh; this tool is n
 
 from __future__ import annotations
 
-import argparse
 import ctypes
 import enum
 import hashlib
@@ -19,7 +17,6 @@ import os
 import platform
 import re
 import shlex
-import shutil
 import socket
 import subprocess
 import sys
@@ -113,13 +110,14 @@ BAND_24             = "2.4GHz"
 DIAG_TIMEOUT        = 300   # seconds for one device's __diag; mca-dump and the controller queries are the slow part
 LOCAL_TIMEOUT       = 90    # seconds for one check of this machine (system_profiler alone can take ~20)
 DEFAULT_LOG_NAME    = "unifi-diagnostics-%Y%m%d-%H%M%S.log"
+INTERNET_HOST       = "1.1.1.1"
+REDACTED            = "<redacted>"
+REMOTE_SCRIPT       = "/tmp/unifi-overhaul.sh"
 
 # This file is src/unifi_overhaul/client.py, so the repo root is three levels up
 REPO_ROOT      = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DEFAULT_SCRIPT = os.path.join(REPO_ROOT, "scripts", "unifi-overhaul.sh")
 LOG_DIR        = os.path.join(REPO_ROOT, "logs")
-INTERNET_HOST       = "1.1.1.1"
-REDACTED            = "<redacted>"
 
 # Model-code prefixes of UniFi gateways / consoles; every other discovered device is treated as an AP
 GATEWAY_MODEL_PREFIXES = ["UX", "UDM", "UDR", "UCG", "UXG", "USG", "UDW"]
@@ -801,9 +799,40 @@ def text_of(raw):
     return raw.decode("utf-8", "replace") if raw else ""
 
 
+def run_ssh(target, remote, stdin, timeout=None):
+    """
+    ssh to one device, run a command there, and feed it `stdin`.
+
+    Args:
+        target (Target): the device.
+        remote (str): the command line to run on the device.
+        stdin (bytes): what to send on the command's stdin (b"" for nothing).
+        timeout (float | None): seconds before ssh is killed; None waits forever.
+
+    Returns:
+        RemoteRun: what the device printed, and how ssh exited.
+
+    Raises:
+        OSError: the ssh binary can't be executed.
+    """
+
+    command = ["ssh", "-o", f"ConnectTimeout={SSH_CONNECT_TIMEOUT}", "-o", "StrictHostKeyChecking=accept-new",
+               target.ssh_target, remote]
+    started = time.monotonic()
+
+    try:
+        result = subprocess.run(command, input=stdin, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired as expired:
+        return RemoteRun(target=target, returncode=-1, stdout=text_of(expired.stdout), stderr=text_of(expired.stderr),
+                         seconds=time.monotonic() - started, is_timed_out=True)
+
+    return RemoteRun(target=target, returncode=result.returncode, stdout=text_of(result.stdout),
+                     stderr=text_of(result.stderr), seconds=time.monotonic() - started)
+
+
 def run_remote(target, script, mode, timeout=None):
     """
-    ssh to one device and run one mode of unifi-overhaul.sh there by piping the script over stdin.
+    Run one mode of unifi-overhaul.sh on a device by piping the script to `sh -s` over ssh.
 
     Args:
         target (Target): the device.
@@ -818,27 +847,17 @@ def run_remote(target, script, mode, timeout=None):
         OSError: the ssh binary can't be executed.
     """
 
-    command = ["ssh", "-o", f"ConnectTimeout={SSH_CONNECT_TIMEOUT}", "-o", "StrictHostKeyChecking=accept-new",
-               target.ssh_target, f"sh -s {mode}"]
-    started = time.monotonic()
-
-    try:
-        result = subprocess.run(command, input=script, capture_output=True, timeout=timeout)
-    except subprocess.TimeoutExpired as expired:
-        return RemoteRun(target=target, returncode=-1, stdout=text_of(expired.stdout), stderr=text_of(expired.stderr),
-                         seconds=time.monotonic() - started, is_timed_out=True)
-
-    return RemoteRun(target=target, returncode=result.returncode, stdout=text_of(result.stdout),
-                     stderr=text_of(result.stderr), seconds=time.monotonic() - started)
+    return run_ssh(target, f"sh -s {mode}", script, timeout)
 
 
-def probe(target, script):
+def probe(target, script, is_quiet=False):
     """
     ssh to one device and run unifi-overhaul.sh's __probe there.
 
     Args:
         target (Target): the device to probe.
         script (bytes): the contents of unifi-overhaul.sh.
+        is_quiet (bool): skip the progress line (for repeated polling).
 
     Returns:
         Device: the probed device; Device.error is set if ssh failed.
@@ -847,12 +866,33 @@ def probe(target, script):
         OSError: the ssh binary can't be executed.
     """
 
-    print(f"[*] probing {target.ssh_target} ...", file=sys.stderr)
+    if not is_quiet:
+        print(f"[*] probing {target.ssh_target} ...", file=sys.stderr)
     run = run_remote(target, script, "__probe")
 
     if run.error:
         return Device(target=target, error=run.error)
     return parse_probe(target, run.stdout)
+
+
+def apply_remote_command(options=""):
+    """
+    The device-side command line that saves the piped unifi-overhaul.sh and runs apply detached.
+
+    Args:
+        options (str): extra apply options, e.g. "--role relay --channel 1"; "" for none.
+
+    Returns:
+        str: the command to run on the device, with the script arriving on stdin.
+
+    Raises:
+        None
+    """
+
+    apply = f"{REMOTE_SCRIPT} apply {options}".rstrip()
+    # </dev/null so the backgrounded apply lets go of the ssh session instead of holding it open
+    return (f"cat > {REMOTE_SCRIPT} && chmod +x {REMOTE_SCRIPT} && "
+            f"nohup {apply} < /dev/null > /tmp/vw.log 2>&1 &")
 
 
 def reapply_command(dev, mesh, script_path):
@@ -872,10 +912,8 @@ def reapply_command(dev, mesh, script_path):
     """
 
     # A relay whose children already dropped would autodetect as a leaf, so force its 2.4 downlink
-    with_ap = " --with-ap" if mesh.is_relay(dev) and not dev.is_root else ""
-    # </dev/null so the backgrounded apply lets go of the ssh session instead of holding it open
-    remote  = (f"cat > /tmp/unifi-overhaul.sh && chmod +x /tmp/unifi-overhaul.sh && "
-               f"nohup /tmp/unifi-overhaul.sh apply{with_ap} < /dev/null > /tmp/vw.log 2>&1 &")
+    options = "--with-ap" if mesh.is_relay(dev) and not dev.is_root else ""
+    remote  = apply_remote_command(options)
     return f"ssh {dev.target.ssh_target} {shlex.quote(remote)} < {shlex.quote(script_path)}"
 
 
@@ -960,159 +998,6 @@ def print_report(mesh, script_path, out=None):
     return ExitStatus.NEEDS_ACTION
 
 
-def discovered_targets(args, explicit_ips):
-    """
-    Run discovery and turn each answering device into a target with the right ssh user.
-
-    Args:
-        args (argparse.Namespace): parsed arguments (broadcast, timeout, users).
-        explicit_ips (set[str]): IPs already given on the command line; those are not overridden.
-
-    Returns:
-        list[Target]: one target per newly discovered device.
-
-    Raises:
-        OSError: the discovery broadcast can't be sent.
-    """
-
-    print(f"[*] discovering UniFi devices (UDP {DISCOVERY_PORT} broadcast to {args.broadcast}, "
-          f"{args.timeout:g}s) ...", file=sys.stderr)
-    targets = []
-
-    for found in discover(args.broadcast, args.timeout):
-        if found.ip in explicit_ips:
-            continue
-        user   = args.gateway_user if found.is_gateway else args.ap_user
-        target = Target(ssh_target=f"{user}@{found.ip}", ip=found.ip, found=found)
-        targets.append(target)
-
-    print(f"[*] discovery found {len(targets)} device(s) not already listed", file=sys.stderr)
-    return targets
-
-
-def collect_targets(args):
-    """
-    Every device to probe: the ones named on the command line first, then any discovered.
-
-    Args:
-        args (argparse.Namespace): parsed arguments.
-
-    Returns:
-        list[Target]: the targets, in probe order.
-
-    Raises:
-        OSError: the discovery broadcast can't be sent.
-    """
-
-    targets = [Target.from_arg(text) for text in args.targets]
-    if args.discover:
-        targets += discovered_targets(args, {target.ip for target in targets})
-    return targets
-
-
-def diagnostics_problems(args):
-    """
-    Check the --diagnostics / --log inputs: the log must be new, and its directory must exist and be writable.
-
-    Args:
-        args (argparse.Namespace): parsed arguments, with args.log already defaulted when --diagnostics is set.
-
-    Returns:
-        list[str]: one sentence per problem; empty when the diagnostics inputs are fine (or unused).
-
-    Raises:
-        None
-    """
-
-    if not args.diagnostics:
-        return ["--log only applies with --diagnostics"] if args.log else []
-    if args.list:
-        return ["--list connects to nothing, so it can't be combined with --diagnostics"]
-
-    folder = os.path.dirname(os.path.abspath(args.log))
-    if os.path.exists(args.log):
-        return [f"log {args.log!r} already exists -- pick another --log (an existing log is never overwritten)"]
-    if not os.path.isdir(folder):
-        return [f"log directory {folder!r} does not exist"]
-    if not os.access(folder, os.W_OK):
-        return [f"log directory {folder!r} is not writable"]
-    return []
-
-
-def input_problems(args):
-    """
-    Check every input this run depends on before doing any work.
-
-    Args:
-        args (argparse.Namespace): parsed arguments.
-
-    Returns:
-        list[str]: one sentence per problem; empty when everything needed is present.
-
-    Raises:
-        None
-    """
-
-    problems = []
-
-    if not os.path.isfile(args.script):
-        problems.append(f"unifi-overhaul.sh not found at {args.script!r} -- it is piped to each device to probe it "
-                        f"(pass --script PATH)")
-    if not shutil.which("ssh"):
-        problems.append("no 'ssh' on PATH -- every device is probed over ssh")
-    if not args.targets and not args.discover:
-        problems.append("nothing to probe -- give [user@]ip targets, or --discover")
-    if args.discover and not args.ap_user:
-        problems.append("--discover needs the APs' ssh user (the UniFi Device-SSH user): "
-                        "pass --ap-user, or set UNIFI_OVERHAUL_AP_USER")
-    try:
-        ipaddress.ip_address(args.broadcast)
-    except ValueError:
-        problems.append(f"--broadcast {args.broadcast!r} is not an IPv4 address")
-
-    problems += diagnostics_problems(args)
-    return problems
-
-
-def report_problems(problems):
-    """
-    Print every input problem found and refuse to run.
-
-    Args:
-        problems (list[str]): the problems.
-
-    Returns:
-        ExitStatus: NOT_RUN.
-
-    Raises:
-        None
-    """
-
-    for problem in problems:
-        print(f"[-] {problem}", file=sys.stderr)
-    print("[-] nothing was probed", file=sys.stderr)
-    return ExitStatus.NOT_RUN
-
-
-def report_no_targets():
-    """
-    Explain that discovery found nothing and nothing else was given.
-
-    Args:
-        None
-
-    Returns:
-        ExitStatus: NOT_RUN.
-
-    Raises:
-        None
-    """
-
-    print("[-] discovery got no replies, so there is nothing to probe -- is this machine on the same LAN as "
-          "the UniFi devices? UDP 10001 must not be firewalled; try --broadcast <subnet>.255", file=sys.stderr)
-    return ExitStatus.NOT_RUN
-
-
 def print_targets(targets, out=None):
     """
     List what would be probed, without connecting to anything.
@@ -1140,71 +1025,6 @@ def print_targets(targets, out=None):
         print(f"      {target.ssh_target:28} {found.hostname or '-':18} {found.model_code or '-':10} "
               f"{found.mac or '-':17} {found.firmware or '-':24} {kind}", file=out)
     return ExitStatus.ALL_LIVE
-
-
-def build_parser():
-    """
-    Build the command-line parser.
-
-    Args:
-        None
-
-    Returns:
-        argparse.ArgumentParser: the parser.
-
-    Raises:
-        None
-    """
-
-    parser = argparse.ArgumentParser(
-        prog="unifi-overhaul-client",
-        description="Probe the UniFi mesh over ssh and show, per device, whether the unifi-overhaul 2.4 GHz "
-                    "backhaul change is LIVE or REVERTED, plus the ordered re-apply commands. With --diagnostics, "
-                    "also collect every read-only diagnostic from each device and this machine into one log. "
-                    "Run on your workstation; exit 0 = all live, 1 = action needed, 3 = nothing probed.")
-    parser.add_argument("targets", nargs="*", metavar="[user@]ip",
-                        help="devices to probe; a bare ip means root@ip")
-    parser.add_argument("--discover", action="store_true",
-                        help="also find devices with the Ubiquiti discovery broadcast (UDP 10001)")
-    parser.add_argument("--list", action="store_true",
-                        help="only list what would be probed; connect to nothing")
-    parser.add_argument("--ap-user", default=os.environ.get("UNIFI_OVERHAUL_AP_USER", ""),
-                        help="ssh user for discovered APs (UniFi Device-SSH user; default $UNIFI_OVERHAUL_AP_USER)")
-    parser.add_argument("--gateway-user", default="root",
-                        help="ssh user for a discovered gateway/console (default: root)")
-    parser.add_argument("--broadcast", default="255.255.255.255",
-                        help="discovery broadcast address (default: 255.255.255.255)")
-    parser.add_argument("--timeout", type=float, default=2.0,
-                        help="seconds to wait for discovery replies (default: 2)")
-    parser.add_argument("--script", default=DEFAULT_SCRIPT,
-                        help="path to unifi-overhaul.sh (default: scripts/unifi-overhaul.sh in this repo)")
-    parser.add_argument("--diagnostics", action="store_true",
-                        help="also run every read-only diagnostic on each device and on this machine, into --log "
-                             "(secrets redacted; takes a minute or two per device)")
-    parser.add_argument("--log", metavar="PATH",
-                        help=f"diagnostics log to create (default: logs/{DEFAULT_LOG_NAME.replace('%', '%%')} in this "
-                             f"repo); never overwrites an existing file")
-    return parser
-
-
-def parse_arguments():
-    """
-    Parse the command line and fill in the default diagnostics log name, which carries the current time.
-
-    Args:
-        None
-
-    Returns:
-        argparse.Namespace: the parsed arguments.
-
-    Raises:
-        SystemExit: argparse rejected the command line (status 2) or printed --help (status 0).
-    """
-
-    args = build_parser().parse_args()
-    if args.diagnostics and not args.log:
-        args.log = os.path.join(LOG_DIR, time.strftime(DEFAULT_LOG_NAME))
-    return args
 
 
 def probe_all(targets, script_path):
@@ -1439,37 +1259,3 @@ def run_diagnostics(args, targets):
 
     report_diagnostics(args.log, log, failed)
     return ExitStatus.NEEDS_ACTION if failed else status
-
-
-def main():
-    """
-    Validate inputs, gather targets, then probe and report (or collect full diagnostics).
-
-    Args:
-        None
-
-    Returns:
-        int: an ExitStatus value.
-
-    Raises:
-        OSError: discovery, reading unifi-overhaul.sh, writing the log, or running ssh failed.
-    """
-
-    args     = parse_arguments()
-    problems = input_problems(args)
-    if problems:
-        return report_problems(problems)
-
-    targets = collect_targets(args)
-    if not targets:
-        return report_no_targets()
-    if args.list:
-        return print_targets(targets)
-    if args.diagnostics:
-        return run_diagnostics(args, targets)
-
-    return print_report(Mesh(probe_all(targets, args.script)), args.script)
-
-
-if __name__ == "__main__":
-    sys.exit(main())

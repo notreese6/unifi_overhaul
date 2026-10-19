@@ -1,4 +1,5 @@
-# diagnostics logs hold MACs, IPs and hostnames from the local network; logs/ itself is kept so the default path exists
+# diagnostics logs and mesh.ini hold MACs, IPs and hostnames from the local network; logs/ itself is kept so the default path exists
 logs/*
 !logs/.gitkeep
 __pycache__/
+mesh.ini

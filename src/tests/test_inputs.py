@@ -6,7 +6,7 @@ import os
 import tempfile
 import unittest
 
-from unifi_overhaul import client
+from unifi_overhaul import cli, client
 
 
 def parse(*argv):
@@ -23,7 +23,7 @@ def parse(*argv):
         SystemExit: argparse rejected the arguments.
     """
 
-    args = client.build_parser().parse_args(list(argv))
+    args = cli.build_parser().parse_args(list(argv))
     if args.diagnostics and not args.log:
         args.log = os.path.join(client.LOG_DIR, "unifi-diagnostics-test.log")
     return args
@@ -35,26 +35,26 @@ class TestDiagnosticsProblems(unittest.TestCase):
     """
 
     def test_log_without_diagnostics(self):
-        self.assertIn("only applies", client.diagnostics_problems(parse("--log", "x.log"))[0])
+        self.assertIn("only applies", cli.diagnostics_problems(parse("--log", "x.log"))[0])
 
     def test_list_with_diagnostics(self):
-        self.assertIn("--list", client.diagnostics_problems(parse("--diagnostics", "--list"))[0])
+        self.assertIn("--list", cli.diagnostics_problems(parse("--diagnostics", "--list"))[0])
 
     def test_existing_log_is_never_overwritten(self):
         with tempfile.NamedTemporaryFile(suffix=".log") as existing:
-            problems = client.diagnostics_problems(parse("--diagnostics", "--log", existing.name))
+            problems = cli.diagnostics_problems(parse("--diagnostics", "--log", existing.name))
         self.assertIn("already exists", problems[0])
 
     def test_missing_directory(self):
-        problems = client.diagnostics_problems(parse("--diagnostics", "--log", "/nonexistent-dir/x.log"))
+        problems = cli.diagnostics_problems(parse("--diagnostics", "--log", "/nonexistent-dir/x.log"))
         self.assertIn("does not exist", problems[0])
 
     def test_default_log_lands_in_logs_dir(self):
-        self.assertEqual(client.diagnostics_problems(parse("--diagnostics")), [])
+        self.assertEqual(cli.diagnostics_problems(parse("--diagnostics")), [])
         self.assertTrue(os.path.isdir(client.LOG_DIR))
 
     def test_plain_run_needs_nothing(self):
-        self.assertEqual(client.diagnostics_problems(parse()), [])
+        self.assertEqual(cli.diagnostics_problems(parse()), [])
 
 
 if __name__ == "__main__":

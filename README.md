@@ -54,7 +54,8 @@ Nothing to build or install. You need:
 | Path | What it is | Runs on |
 |---|---|---|
 | `scripts/unifi-overhaul.sh` | The change itself: `status`, `dryrun`, `apply`, `rollback` | each UniFi device |
-| `./unifi-overhaul-client` | Mesh map, re-apply commands, and full diagnostics, over ssh | your computer |
+| `./unifi-overhaul-client` | Mesh map, `--apply`, and full diagnostics, over ssh | your computer |
+| `mesh.example.ini` | Template for describing your mesh | copy to `~/.config/unifi-overhaul/` |
 | `src/unifi_overhaul/` | The client's Python package (standard library only, Python 3.8+) | your computer |
 | `src/tests/` | Its tests | your computer |
 | `logs/` | Diagnostics output (gitignored) | your computer |
@@ -129,44 +130,86 @@ straight in. Give the APs fixed IPs in UniFi so these addresses don't change.
 
 ## Quick start
 
-### 1. Look at the mesh
+### 1. Describe your mesh (once)
+
+Copy `mesh.example.ini` to `~/.config/unifi-overhaul/mesh.ini` and fill it in. It lives outside
+the repo because it holds your own addresses. One section per device; give each AP the device
+it should connect through:
+
+```ini
+[mesh]
+channel = 1
+
+[gateway]
+host = <gateway-ip>
+user = root
+
+[ap-hall]
+host   = ap-hall          # an IP, or an alias from ~/.ssh/config
+parent = gateway
+
+[ap-far]
+host   = ap-far
+parent = ap-hall
+```
+
+Leave `user` out to let `~/.ssh/config` choose it. Roles follow from the tree: the device with no
+parent is the root, an AP with children is a relay, and one without is a leaf.
+
+### 2. Look at the mesh
 
 ```sh
-./unifi-overhaul-client root@<gateway-ip> <device-ssh-user>@<ap-ip> <device-ssh-user>@<ap-ip> ...
+./unifi-overhaul-client
 ```
 
 ```
 [*] mesh map (indented = uplinks to the line above; [band signal] is the uplink; [2.4: ...] = is the change live here)
-gateway (192.168.1.1)   (root, wired)   [2.4: REVERTED]
-    ap-hall (192.168.1.20)   <--[uplink 5GHz -70dBm]   [2.4: REVERTED]
-        ap-far (192.168.1.21)   <--[uplink 5GHz -78dBm]   [2.4: REVERTED]
+gateway (192.168.1.1)   (root, wired)   [2.4: LIVE]
+    ap-hall (192.168.1.20)   <--[uplink 2.4GHz -60dBm]   [2.4: LIVE]
+    ap-far (192.168.1.21)   <--[uplink 2.4GHz -78dBm]   [2.4: LIVE]
+
+[-] ap-far is connected to gateway, mesh.ini says ap-hall -- run --apply
+[-] ap-far's uplink is weak (-78 dBm, below -75)
 ```
 
-Indentation is the real tree: each device sits under the one it's connected to. `--discover`
-finds devices with Ubiquiti's discovery broadcast instead of a list, but APs don't always
-answer it, so naming them is more reliable.
+Indentation is the real tree: each device sits under the one it's connected to. Here `ap-far`
+has gone around its relay to the gateway, which `mesh.ini` makes visible.
 
-### 2. Apply, in tree order
+### 3. Apply
 
-Each device needs the one above it already offering 2.4 GHz, so go **root → relays → leaves**,
-one at a time. The client prints the exact command for every device that needs it, in order:
+```sh
+./unifi-overhaul-client --apply
+```
+
+```
+[*] plan (parents first):
+      gateway (root): ok -- offering 2.4 GHz
+      ap-hall (relay): apply -- not offering 2.4 GHz to ap-far
+      ap-far (leaf): reboot -- connected to gateway, mesh.ini says ap-hall
+Make these changes? [y/N]
+```
+
+It shows the plan and asks first. Then it works down the tree, parents first, and after each
+change waits until that device matches `mesh.ini` before touching the next. If a device doesn't
+settle, it stops there and says why, leaving everything below it alone. A device that's already
+right is skipped, so `--apply` is safe to run any time: after a power cut, a trip, or whenever
+the map shows something wrong. `--yes` skips the question.
+
+Each change restarts wifi on that device for 20–30 seconds, so run it from a computer that isn't
+connected *through* the APs being changed, ideally one wired to the gateway.
+
+### Without mesh.ini
+
+Name the devices instead (`./unifi-overhaul-client root@<gateway-ip> <user>@<ap-ip> ...`). The map
+then prints a ready-to-paste command for each device that needs applying, in order, like this:
 
 ```sh
 ssh gateway 'cat > /tmp/unifi-overhaul.sh && chmod +x /tmp/unifi-overhaul.sh &&
   nohup /tmp/unifi-overhaul.sh apply < /dev/null > /tmp/vw.log 2>&1 &' < scripts/unifi-overhaul.sh
 ```
 
-Use `apply --with-ap` on every **relay** (an AP that others connect through). See
-[Roles](#roles) for why.
-
-`apply` restarts wifi on that device for 20–30 seconds, so it runs detached (`nohup … &`) and
-your ssh session is allowed to drop. Run it from a computer that isn't connected *through* the
-device you're changing, ideally one wired to the gateway.
-
-### 3. Verify
-
-Wait about 30 seconds, re-run the map, and repeat for the next device. Every line should end
-in `[2.4: LIVE]`, with each AP indented under the parent you expect.
+Run them one at a time, root first, re-running the map in between. Use `apply --with-ap` on every
+relay, for the reason in [Roles](#roles).
 
 ---
 
@@ -178,14 +221,19 @@ in `[2.4: LIVE]`, with each AP indented under the parent you expect.
 | **relay** | A wireless AP that other APs connect through | Moves its uplink to 2.4 GHz **and** offers a 2.4 GHz network |
 | **leaf** | A wireless AP with nothing connected through it | Moves its uplink to 2.4 GHz |
 
-The script works out the role from what's connected *at that moment*. **That's a trap after an
-outage:** if a relay is re-applied while the APs below it are still disconnected, it looks like
-a leaf, offers no 2.4 GHz network, and the APs below either can't connect or reach past it to a
-weaker parent. So always apply relays with `--with-ap`. The map shows the symptom as an AP
-indented one level too shallow, usually with a weak uplink signal.
+With `mesh.ini`, roles come from the tree you wrote down. Without it, the script works the role
+out from what's connected *at that moment*, **which is a trap after an outage**. A relay re-applied
+while the APs below it are still disconnected looks like a leaf and offers no 2.4 GHz network.
+The APs below then either can't connect, or reach past it to a weaker parent. So pass `--with-ap`
+to every relay when applying by hand.
 
-The whole 2.4 GHz chain must share one channel (`--channel N`, default 1), because a relay's
-single 2.4 GHz radio is both its uplink and the network it offers.
+`apply` only adds what's missing, so running it again on a device that's already applied
+changes nothing.
+
+The whole 2.4 GHz chain must share one channel (`channel` in `mesh.ini`, or `--channel N`;
+default 1), because a relay's single 2.4 GHz radio is both its uplink and the network it offers.
+Changing the channel of a mesh that's already applied isn't automated yet, so keep `channel` set
+to the one your mesh is on.
 
 ---
 
@@ -209,26 +257,28 @@ Change per-device settings only on APs that can still connect on 5 GHz.
 
 | Situation | Fix |
 |---|---|
-| A device shows `REVERTED` | Run the command the map prints for it, in the order printed |
-| APs isolated after a power cut | Re-apply the **gateway** first; the APs are already looking for it on 2.4 GHz |
-| An AP is isolated and unreachable (provisioned back to 5 GHz, out of 5 GHz range) | Move it next to its parent, or wire it temporarily, then re-apply its parent and it (`--with-ap` if it's a relay), then put it back |
-| An AP's uplink skipped its relay | Apply the relay with `--with-ap`, then reboot the AP so it picks the stronger parent |
-| You want stock back on one device | `rollback` (only from the same boot as the `apply`), or force a re-provision of that device from the UniFi app |
+| Anything shows `REVERTED`, or the map flags a wrong parent | `./unifi-overhaul-client --apply` |
+| APs isolated after a power cut | `--apply`: it fixes the gateway first, then waits for the APs to come back on 2.4 GHz |
+| An AP stays unreachable (provisioned back to 5 GHz, out of 5 GHz range) | `--apply` stops at it. Move it next to its parent, or wire it temporarily, run `--apply`, then put it back |
+| You want stock back on one device | `rollback` (only from the same boot as the first `apply`), or force a re-provision of that device from the UniFi app |
 
 ---
 
 ## The client
 
 ```sh
-./unifi-overhaul-client [user@]ip ...                 # mesh map + ordered re-apply commands
+./unifi-overhaul-client                               # mesh map for the devices in mesh.ini, plus warnings
+./unifi-overhaul-client --apply [--yes]               # make the mesh match mesh.ini
+./unifi-overhaul-client [user@]ip ...                 # mesh map for these devices instead
 ./unifi-overhaul-client --discover --ap-user USER     # find devices by broadcast instead
 ./unifi-overhaul-client ... --list                    # show what would be probed, connect to nothing
 ./unifi-overhaul-client ... --diagnostics             # everything, into logs/unifi-diagnostics-<time>.log
 ```
 
-A bare IP means `root@`. With `--discover`, gateways are reached as `--gateway-user` (default
-`root`) and everything else as `--ap-user` (or `$UNIFI_OVERHAUL_AP_USER`). The client only reads;
-it prints commands and never runs them.
+`--mesh PATH` reads a different `mesh.ini`. A bare IP on the command line means `root@`. With
+`--discover`, gateways are reached as `--gateway-user` (default `root`) and everything else as
+`--ap-user` (or `$UNIFI_OVERHAUL_AP_USER`). Only `--apply` changes anything; every other mode
+only reads.
 
 | Tag | Meaning |
 |---|---|
@@ -237,8 +287,8 @@ it prints commands and never runs them.
 | `PARTIAL` | A relay with only one side on 2.4 GHz; check its `status` |
 | `UNREACHABLE` | ssh failed; the reason is shown, fix it before trusting the rest |
 
-Exit status: `0` all live, `1` something needs action, `2` bad command line, `3` nothing was
-probed (a missing input).
+Exit status: `0` all live (or `--apply` finished), `1` something needs action (or `--apply`
+stopped), `2` bad command line, `3` nothing was probed (a missing input, or you declined the plan).
 
 ### Diagnostics
 
@@ -267,7 +317,7 @@ Run as `/tmp/unifi-overhaul.sh MODE [options]` on a device.
 | Mode | Changes anything? | What it does |
 |---|---|---|
 | `status` (default) | no | This device's uplink, downlinks, role, and whether 2.4 GHz is live |
-| `dryrun` | no | The exact config diff `apply` would make, plus the command to run it |
+| `dryrun` | no | The exact config diff `apply` would make (or that it would change nothing) |
 | `apply` | **yes** | Make the change (restarts wifi on this device for 20–30 s) |
 | `rollback` | yes | Restore the backup taken by `apply` during this boot |
 | `avail` | scans, after asking | Current uplink signal, then optionally scans the other bands |
