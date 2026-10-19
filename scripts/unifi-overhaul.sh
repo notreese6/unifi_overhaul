@@ -173,6 +173,12 @@ diag_controller(){   # the UniFi Network app's own view (gateway/console only), 
            'db.alarm.find().sort({time: -1}).limit(50).forEach(printjson)'; do
     echo "--- $q"; $TO "$m" --quiet --port 27117 ace --eval "$q" 2>&1
   done; }
+# __devices: the adopted devices the UniFi Network app knows about, one "D ip mac type model name" line each
+# (tab-separated), for unifi-overhaul-client --discover. Read-only; only a console runs the app.
+do_devices(){
+  m=$(command -v mongo || command -v mongosh) || { echo "E no mongo client -- not a UniFi console"; return 0; }
+  $m --quiet --port 27117 ace --eval 'db.device.find({adopted: true}, {ip: 1, mac: 1, type: 1, model: 1, name: 1}).forEach(function (d) { print(["D", d.ip, d.mac, d.type, d.model, d.name].join("\t")); })' 2>&1
+}
 do_diag(){
   TO=""; have timeout && TO="timeout 60"
   diag_section "identity"
@@ -431,10 +437,11 @@ show_avail(){
 
 
 case "$MODE" in -h|--help|help) usage; exit 0 ;; esac
-# __probe / __diag (remote helpers for unifi-overhaul-client) must run even when detect would fail -> handle before it
+# __probe / __diag / __devices (remote helpers for unifi-overhaul-client) must run even when detect would fail -> handle before it
 case "$MODE" in
   __probe) do_probe; exit 0 ;;
   __diag)  do_diag; exit 0 ;;
+  __devices) do_devices; exit 0 ;;
 esac
 detect
 [ "$MODE" = status ] || [ "$MODE" = avail ] || \

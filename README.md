@@ -270,15 +270,19 @@ Change per-device settings only on APs that can still connect on 5 GHz.
 ./unifi-overhaul-client                               # mesh map for the devices in mesh.ini, plus warnings
 ./unifi-overhaul-client --apply [--yes]               # make the mesh match mesh.ini
 ./unifi-overhaul-client [user@]ip ...                 # mesh map for these devices instead
-./unifi-overhaul-client --discover --ap-user USER     # find devices by broadcast instead
+./unifi-overhaul-client --discover --ap-user USER     # find the devices instead of listing them
 ./unifi-overhaul-client ... --list                    # show what would be probed, connect to nothing
 ./unifi-overhaul-client ... --diagnostics             # everything, into logs/unifi-diagnostics-<time>.log
 ```
 
-`--mesh PATH` reads a different `mesh.ini`. A bare IP on the command line means `root@`. With
-`--discover`, gateways are reached as `--gateway-user` (default `root`) and everything else as
-`--ap-user` (or `$UNIFI_OVERHAUL_AP_USER`). Only `--apply` changes anything; every other mode
-only reads.
+`--mesh PATH` reads a different `mesh.ini`. A bare IP on the command line means `root@`.
+
+`--discover` sends Ubiquiti's discovery broadcast, then asks the controller on any gateway that
+answers for every device it has adopted, since APs don't always answer the broadcast themselves.
+Gateways are reached as `--gateway-user` (default `root`) and everything else as `--ap-user` (or
+`$UNIFI_OVERHAUL_AP_USER`).
+
+Only `--apply` changes anything; every other mode only reads.
 
 | Tag | Meaning |
 |---|---|

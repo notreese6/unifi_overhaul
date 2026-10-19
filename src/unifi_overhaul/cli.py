@@ -34,31 +34,99 @@ def uses_mesh_file(args):
     return args.apply or (not args.targets and not args.discover)
 
 
-def discovered_targets(args, explicit_ips):
+def read_script(path):
     """
-    Run discovery and turn each answering device into a target with the right ssh user.
+    Read the on-device script that gets piped to each device.
 
     Args:
-        args (argparse.Namespace): parsed arguments (broadcast, timeout, users).
+        path (str): local path of unifi-overhaul.sh.
+
+    Returns:
+        bytes: its contents.
+
+    Raises:
+        OSError: the file can't be read.
+    """
+
+    with open(path, "rb") as handle:
+        return handle.read()
+
+
+def discovered_target(args, found):
+    """
+    A target for a discovered device, reached as the gateway user or the AP user.
+
+    Args:
+        args (argparse.Namespace): parsed arguments (users).
+        found (client.DiscoveredDevice): the device.
+
+    Returns:
+        client.Target: the target.
+
+    Raises:
+        None
+    """
+
+    user = args.gateway_user if found.is_gateway else args.ap_user
+    return client.Target(ssh_target=f"{user}@{found.ip}", ip=found.ip, found=found)
+
+
+def controller_devices(gateway, script):
+    """
+    Ask a gateway's UniFi Network app for every device it has adopted, since APs don't always answer the broadcast.
+
+    Args:
+        gateway (client.Target): the gateway found by the broadcast.
+        script (bytes): the contents of unifi-overhaul.sh.
+
+    Returns:
+        list[client.DiscoveredDevice]: the adopted devices; [] when the gateway can't be asked.
+
+    Raises:
+        OSError: ssh can't be executed.
+    """
+
+    print(f"[*] asking the controller on {gateway.ssh_target} for its adopted devices ...", file=sys.stderr)
+    run = client.run_remote(gateway, script, "__devices", timeout=client.SSH_CONNECT_TIMEOUT * 5)
+    if run.error:
+        print(f"[-] couldn't ask {gateway.ssh_target} ({run.error}), so only devices that answered the broadcast "
+              f"are listed", file=sys.stderr)
+        return []
+    return client.parse_device_list(run.stdout)
+
+
+def discovered_targets(args, explicit_ips):
+    """
+    Find devices by broadcast, then add every device the gateway's controller has adopted.
+
+    Args:
+        args (argparse.Namespace): parsed arguments (broadcast, timeout, users, script).
         explicit_ips (set[str]): IPs already given on the command line; those are not overridden.
 
     Returns:
-        list[client.Target]: one target per newly discovered device.
+        list[client.Target]: one target per newly found device, broadcast replies first.
 
     Raises:
-        OSError: the discovery broadcast can't be sent.
+        OSError: the discovery broadcast can't be sent, unifi-overhaul.sh can't be read, or ssh can't be executed.
     """
 
     print(f"[*] discovering UniFi devices (UDP {client.DISCOVERY_PORT} broadcast to {args.broadcast}, "
           f"{args.timeout:g}s) ...", file=sys.stderr)
+    known   = set(explicit_ips)
     targets = []
 
     for found in client.discover(args.broadcast, args.timeout):
-        if found.ip in explicit_ips:
-            continue
-        user   = args.gateway_user if found.is_gateway else args.ap_user
-        target = client.Target(ssh_target=f"{user}@{found.ip}", ip=found.ip, found=found)
-        targets.append(target)
+        if found.ip not in known:
+            known.add(found.ip)
+            targets.append(discovered_target(args, found))
+
+    gateways = [target for target in targets if target.found.is_gateway]
+    script   = read_script(args.script) if gateways else b""
+    for gateway in gateways:
+        for found in controller_devices(gateway, script):
+            if found.ip not in known:
+                known.add(found.ip)
+                targets.append(discovered_target(args, found))
 
     print(f"[*] discovery found {len(targets)} device(s) not already listed", file=sys.stderr)
     return targets
@@ -76,7 +144,7 @@ def collect_targets(args, topology):
         list[client.Target]: the targets, in probe order.
 
     Raises:
-        OSError: the discovery broadcast can't be sent.
+        OSError: the discovery broadcast can't be sent, unifi-overhaul.sh can't be read, or ssh can't be executed.
     """
 
     if topology is not None:
@@ -315,24 +383,6 @@ def parse_arguments():
     if args.diagnostics and not args.log:
         args.log = os.path.join(client.LOG_DIR, time.strftime(client.DEFAULT_LOG_NAME))
     return args
-
-
-def read_script(path):
-    """
-    Read the on-device script that gets piped to each device.
-
-    Args:
-        path (str): local path of unifi-overhaul.sh.
-
-    Returns:
-        bytes: its contents.
-
-    Raises:
-        OSError: the file can't be read.
-    """
-
-    with open(path, "rb") as handle:
-        return handle.read()
 
 
 def run_apply(args, topology):

@@ -746,6 +746,39 @@ def discover(broadcast, timeout):
     return sorted(found.values(), key=lambda dev: ipaddress.ip_address(dev.ip))
 
 
+def parse_device_list(output):
+    """
+    Turn unifi-overhaul.sh __devices output (the controller's adopted devices) into discovered devices.
+
+    Args:
+        output (str): tab-separated "D ip mac type model name" lines; anything else is ignored.
+
+    Returns:
+        list[DiscoveredDevice]: one per adopted device with a usable IP; [] when the gateway had no list.
+
+    Raises:
+        None
+    """
+
+    found = []
+
+    for line in output.splitlines():
+        fields = line.split("\t")
+        if len(fields) < 6 or fields[0] != "D":
+            continue
+        # A device the controller hasn't seen online has no IP, and isn't reachable to probe anyway
+        try:
+            ipaddress.ip_address(fields[1])
+        except ValueError:
+            continue
+        name   = "\t".join(fields[5:])
+        device = DiscoveredDevice(ip=fields[1], mac=fields[2].lower(), platform=fields[4],
+                                  hostname="" if name == "undefined" else name)
+        found.append(device)
+
+    return found
+
+
 def parse_probe(target, output):
     """
     Turn __probe's line-oriented output into a Device.
