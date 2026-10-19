@@ -365,7 +365,7 @@ def build_parser():
                         help="fix every device that doesn't match mesh.ini, parents first, checking each one")
     parser.add_argument("--install-self-heal", action="store_true",
                         help="on mesh.ini's gateway, re-apply 2.4 GHz after every reboot and provision (a systemd "
-                             "timer; re-run after a firmware update)")
+                             "timer; the map shows whether it's still active)")
     parser.add_argument("--remove-self-heal", action="store_true",
                         help="stop the gateway self-heal and delete exactly the files it installed")
     parser.add_argument("--yes", action="store_true",

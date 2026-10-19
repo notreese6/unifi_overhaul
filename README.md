@@ -95,8 +95,8 @@ ssh-copy-id -i ~/.ssh/unifi_rsa.pub root@<gateway-ip>
 ```
 
 `ssh-copy-id` logs in with the password one last time and appends your public key to the
-gateway's `~/.ssh/authorized_keys`. It survives reboots. A firmware update may remove it; if
-`ssh gateway` starts asking for a password again, re-run the command.
+gateway's `~/.ssh/authorized_keys`. It survives reboots and, on the Express 7 tested, firmware
+updates. If `ssh gateway` ever asks for a password again, re-run the command.
 
 ### 4. Tell ssh which key and user to use
 
@@ -269,10 +269,11 @@ and puts back any key a firmware update removes.
 | On the gateway | What it is |
 |---|---|
 | `/data/unifi-overhaul/` | A copy of the script, the channel, and the key snapshot. `/data` survives firmware updates |
-| `/etc/systemd/system/unifi-overhaul-heal.{service,timer}` | The timer. **A firmware update probably removes these**, so run `--install-self-heal` again afterwards |
+| `/etc/systemd/system/unifi-overhaul-heal.{service,timer}` | The timer. UniFi OS keeps its root filesystem's changes across firmware updates on the Express 7 tested, so these should survive one. A factory reset removes everything |
 
 The map shows its state on the gateway's line (`[self-heal: active]`). Check it after the
-gateway's next reboot to confirm the timer survived. Its log: `journalctl -u unifi-overhaul-heal`.
+gateway's next reboot, and after a firmware update, to confirm the timer survived; if it shows
+`not installed`, run `--install-self-heal` again. Its log: `journalctl -u unifi-overhaul-heal`.
 `--remove-self-heal` deletes exactly the files above. If anything else has ended up in
 `/data/unifi-overhaul/`, it leaves the folder and says so.
 
