@@ -45,7 +45,7 @@ def gateway(has_24=True):
         None
     """
 
-    lines = ["H Express-7", "W 3", "U WIRED - -", f"A {ROOT_5} 5GHz"]
+    lines = ["H gateway", "W 3", "U WIRED - -", f"A {ROOT_5} 5GHz"]
     if has_24:
         lines.append(f"A {ROOT_24} 2.4GHz")
     return device("192.0.2.1", "\n".join(lines))
@@ -57,8 +57,8 @@ class TestParseProbe(unittest.TestCase):
     """
 
     def test_fields(self):
-        dev = device("192.0.2.195", f"H U7-Pro-Wall\nW 3\nU {ROOT_24.upper()} 2.4GHz -60\nA {RELAY_24} 2.4GHz\n")
-        self.assertEqual(dev.host, "U7-Pro-Wall")
+        dev = device("192.0.2.20", f"H ap-hall\nW 3\nU {ROOT_24.upper()} 2.4GHz -60\nA {RELAY_24} 2.4GHz\n")
+        self.assertEqual(dev.host, "ap-hall")
         self.assertEqual(dev.uplink, ROOT_24)
         self.assertEqual((dev.uplink_band, dev.uplink_signal), ("2.4GHz", "-60"))
         self.assertEqual(dev.aps, [(RELAY_24, "2.4GHz")])
@@ -74,36 +74,36 @@ class TestMeshState(unittest.TestCase):
     """
 
     def test_chain_all_live(self):
-        relay = device("192.0.2.195", f"H wall\nW 3\nU {ROOT_24} 2.4GHz -60\nA {RELAY_24} 2.4GHz")
-        leaf  = device("192.0.2.72", f"H pro\nW 3\nU {RELAY_24} 2.4GHz -58")
+        relay = device("192.0.2.20", f"H wall\nW 3\nU {ROOT_24} 2.4GHz -60\nA {RELAY_24} 2.4GHz")
+        leaf  = device("192.0.2.21", f"H pro\nW 3\nU {RELAY_24} 2.4GHz -58")
         mesh  = client.Mesh([gateway(), relay, leaf])
 
         self.assertEqual([mesh.state(d) for d in mesh.devices], [client.State.LIVE] * 3)
         self.assertEqual([(d.host, depth) for d, depth in mesh.tree_order()],
-                         [("Express-7", 0), ("wall", 1), ("pro", 2)])
+                         [("gateway", 0), ("wall", 1), ("pro", 2)])
 
     def test_leaf_that_skips_the_relay_hangs_off_the_root(self):
-        relay = device("192.0.2.195", f"H wall\nW 3\nU {ROOT_24} 2.4GHz -60")
-        leaf  = device("192.0.2.72", f"H pro\nW 3\nU {ROOT_24} 2.4GHz -78")
+        relay = device("192.0.2.20", f"H wall\nW 3\nU {ROOT_24} 2.4GHz -60")
+        leaf  = device("192.0.2.21", f"H pro\nW 3\nU {ROOT_24} 2.4GHz -78")
         mesh  = client.Mesh([gateway(), relay, leaf])
 
         self.assertEqual([(d.host, depth) for d, depth in mesh.tree_order()],
-                         [("Express-7", 0), ("wall", 1), ("pro", 1)])
+                         [("gateway", 0), ("wall", 1), ("pro", 1)])
 
     def test_reverted_root(self):
         mesh = client.Mesh([gateway(has_24=False)])
         self.assertEqual(mesh.state(mesh.devices[0]), client.State.REVERTED)
 
     def test_relay_with_only_its_uplink_on_24_is_partial(self):
-        relay = device("192.0.2.195", f"H wall\nW 3\nU {ROOT_24} 2.4GHz -60\nA {RELAY_5} 5GHz")
-        leaf  = device("192.0.2.72", f"H pro\nW 3\nU {RELAY_5} 5GHz -73")
+        relay = device("192.0.2.20", f"H wall\nW 3\nU {ROOT_24} 2.4GHz -60\nA {RELAY_5} 5GHz")
+        leaf  = device("192.0.2.21", f"H pro\nW 3\nU {RELAY_5} 5GHz -73")
         mesh  = client.Mesh([gateway(), relay, leaf])
 
         self.assertEqual(mesh.state(relay), client.State.PARTIAL)
         self.assertEqual(mesh.state(leaf), client.State.REVERTED)
 
     def test_unreachable(self):
-        lost = client.Device(target=client.Target(ssh_target="u@192.0.2.72", ip="192.0.2.72"), error="timeout")
+        lost = client.Device(target=client.Target(ssh_target="u@192.0.2.21", ip="192.0.2.21"), error="timeout")
         mesh = client.Mesh([gateway(), lost])
         self.assertEqual(mesh.state(lost), client.State.UNREACHABLE)
 

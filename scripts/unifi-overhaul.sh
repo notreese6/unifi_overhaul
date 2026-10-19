@@ -1,6 +1,7 @@
 #!/bin/sh
 # unifi-overhaul.sh — force a 2.4 GHz UniFi wireless backhaul (vwire) alongside the 5 GHz one.
-# Non-persistent: edits /tmp/system.cfg + applies via syswrapper. Reboot/controller-change reverts.
+# Edits /tmp/system.cfg + applies via syswrapper. An AP saves it to flash once its uplink reconnects;
+# the gateway loses it on reboot; any controller provision puts stock 5 GHz back. See README.
 #   ./unifi-overhaul.sh status|dryrun|apply|rollback|avail|help  [--role root|leaf|relay] [--channel N] [--with-ap]
 # Role autodetected: ROOT (wired, adds a 2.4 downlink), LEAF (moves its uplink STA to 2.4),
 # RELAY (leaf that feeds other APs: moves uplink AND adds a 2.4 downlink). 'status' shows the chain.
@@ -18,7 +19,8 @@ while [ $# -gt 0 ]; do case "$1" in
 
 usage(){ cat <<EOF
 unifi-overhaul.sh — add a 2.4 GHz UniFi wireless backhaul (vwire) alongside the 5 GHz one.
-Non-persistent: edits /tmp/system.cfg + applies the incremental diff. Reboot reverts.
+An AP keeps it across reboots once saved; the gateway loses it on reboot; a controller
+provision reverts everything. See the README's 'What survives what'.
 
 Usage: unifi-overhaul.sh [MODE] [options]
   MODE (default: status):
@@ -34,7 +36,8 @@ Usage: unifi-overhaul.sh [MODE] [options]
   options:
     --role root|leaf|relay   override the autodetected role
     --channel N              2.4 GHz channel (default 1); MUST match on every device
-    --with-ap                force the 2.4 downlink on a leaf (only if downstream APs aren't up yet)
+    --with-ap                offer a 2.4 GHz downlink; use on every relay (detection can't see APs
+                             that aren't connected yet, e.g. after an outage)
     --force                  skip the avail scan confirmation prompt
 
 Role (autodetected, shown by 'status'): ROOT = wired gateway, adds a 2.4 downlink (keeps 5/6).
@@ -279,7 +282,8 @@ transform(){ out=$1; cp -f "$CFG" "$out"
 apply_cfg(){
   # syswrapper's own apply path: fast-apply when it can, and an AUTOMATIC full wifi restart for
   # changes fast-apply can't do (e.g. moving a vap between radios -- 'parent unhandled'). 'nopersist'
-  # skips the /data write, so a reboot still reverts. A full restart briefly drops ALL wifi (~20-30s).
+  # skips the immediate flash write; an AP still saves its running config once its uplink reconnects.
+  # A full restart briefly drops ALL wifi (~20-30s).
   /usr/bin/syswrapper.sh apply-config "$CFG" nopersist; }
 
 change_applied(){   # live ground-truth: is a 2.4GHz vwire in use on this device?
@@ -393,7 +397,7 @@ show_avail(){
     echo "  #  whole chip. If your backhaul is WEAK or MULTI-HOP, the scan    #"
     echo "  #  can DROP the uplink -- and can knock out any AP that meshes    #"
     echo "  #  THROUGH this one -- freezing them until a PHYSICAL POWER-CYCLE.#"
-    echo "  #  Nothing persists (a reboot restores 5 GHz), but you may lose   #"
+    echo "  #  A power-cycle brings it back, but you may lose                 #"
     echo "  #  your connection to this AP right now. If in doubt: don't.      #"
     echo "  #################################################################"
     printf "  Type exactly 'yes' to scan the other band(s), anything else aborts: "
@@ -447,9 +451,9 @@ case "$MODE" in
     log "[*] applying via syswrapper (a vap moving radios triggers a full wifi restart -- all wifi drops ~20-30s)..."
     apply_cfg
     log "[+] apply issued. wait ~30s for wifi to settle, then run: /tmp/unifi-overhaul.sh status"
-    [ "$ROLE" = leaf ] && log "[!] if this AP stays silent past ~1min, power-cycle it (reboot reverts to 5 GHz)" ;;
+    [ "$ROLE" = leaf ] && log "[-] if this AP stays silent past ~1min, power-cycle it; if it still can't connect, see the README's Recovery" ;;
   rollback) if [ -f "$BAK" ]; then cp -f "$BAK" "$CFG"; log "[*] restoring backup + applying..."; apply_cfg
     log "[+] rolled back. wait ~30s then run: /tmp/unifi-overhaul.sh status"
-    else log "[-] no backup — reboot to revert"; fi ;;
+    else log "[-] no backup from this boot -- force a re-provision of this device from the UniFi app to restore stock"; fi ;;
   *) log "[-] mode: status|dryrun|apply|rollback|avail|help"; exit 2 ;;
 esac

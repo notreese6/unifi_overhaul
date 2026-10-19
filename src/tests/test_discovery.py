@@ -54,25 +54,25 @@ class TestFromReply(unittest.TestCase):
     """
 
     def test_reads_every_known_field(self):
-        packet = reply(field(client.Tlv.HWADDR, MAC), field(client.Tlv.HOSTNAME, b"Express-7"),
-                       field(client.Tlv.PLATFORM, b"UX7"), field(client.Tlv.FIRMWARE, b"UXMAX.ipq5322.v5.2.10"))
+        packet = reply(field(client.Tlv.HWADDR, MAC), field(client.Tlv.HOSTNAME, b"gateway"),
+                       field(client.Tlv.PLATFORM, b"UDR"), field(client.Tlv.FIRMWARE, b"1.0.0"))
         device = client.DiscoveredDevice.from_reply(packet, "192.0.2.1")
 
         self.assertEqual(device.ip, "192.0.2.1")
         self.assertEqual(device.mac, "02:00:00:00:00:01")
-        self.assertEqual(device.hostname, "Express-7")
-        self.assertEqual(device.firmware, "UXMAX.ipq5322.v5.2.10")
+        self.assertEqual(device.hostname, "gateway")
+        self.assertEqual(device.firmware, "1.0.0")
         self.assertTrue(device.is_gateway)
 
     def test_mac_falls_back_to_ipinfo(self):
-        ipinfo = bytes(client.IpInfo(mac=client.MacAddress(*MAC), ip=(ctypes.c_uint8 * 4)(192, 0, 2, 72)))
-        device = client.DiscoveredDevice.from_reply(reply(field(client.Tlv.IPINFO, ipinfo)), "192.0.2.72")
+        ipinfo = bytes(client.IpInfo(mac=client.MacAddress(*MAC), ip=(ctypes.c_uint8 * 4)(192, 0, 2, 21)))
+        device = client.DiscoveredDevice.from_reply(reply(field(client.Tlv.IPINFO, ipinfo)), "192.0.2.21")
         self.assertEqual(device.mac, "02:00:00:00:00:01")
 
     def test_truncated_value_is_dropped(self):
-        packet = reply(field(client.Tlv.HOSTNAME, b"U7-Pro"), field(client.Tlv.PLATFORM, b"U7PRO"))[:-2]
-        device = client.DiscoveredDevice.from_reply(packet, "192.0.2.72")
-        self.assertEqual(device.hostname, "U7-Pro")
+        packet = reply(field(client.Tlv.HOSTNAME, b"ap-far"), field(client.Tlv.PLATFORM, b"UAPX"))[:-2]
+        device = client.DiscoveredDevice.from_reply(packet, "192.0.2.21")
+        self.assertEqual(device.hostname, "ap-far")
         self.assertEqual(device.platform, "")
 
     def test_own_probe_echo_is_ignored(self):
@@ -84,7 +84,7 @@ class TestFromReply(unittest.TestCase):
         self.assertIsNone(client.DiscoveredDevice.from_reply(bytes(packet), "192.0.2.9"))
 
     def test_access_point_is_not_a_gateway(self):
-        device = client.DiscoveredDevice(ip="192.0.2.72", platform="U7PRO")
+        device = client.DiscoveredDevice(ip="192.0.2.21", platform="UAPX")
         self.assertFalse(device.is_gateway)
 
 
