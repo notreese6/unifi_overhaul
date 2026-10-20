@@ -32,8 +32,13 @@ class FakeRadio:
     """
     A fake syswrapper plus the files standing in for a device's live state, all in one temporary folder.
     A successful apply-config makes the 2.4 GHz change live (the fake iw then reports it); while the fail
-    marker exists, apply-config fails the way the real one does when the radio manager is busy.
+    marker exists, apply-config fails the way the real one does when the radio manager is busy; and the
+    fake radiomgrctl reports busy for as many status checks as set_busy() asks.
     """
+
+    # Short waits, so a test of a busy radio manager takes about a second rather than minutes
+    POLL_SECONDS = 1
+    WAIT_SECONDS = 3
 
     def __init__(self, folder):
         """
@@ -53,6 +58,7 @@ class FakeRadio:
         self.calls      = os.path.join(folder, "syswrapper.calls")
         self.live       = os.path.join(folder, "radio.live")
         self.fail       = os.path.join(folder, "syswrapper.fail")
+        self.busy       = os.path.join(folder, "radiomgr.busy")
         self.run_dir    = os.path.join(folder, "run")
 
         with open(self.syswrapper, "w", encoding="utf-8") as handle:
@@ -80,7 +86,25 @@ class FakeRadio:
         """
 
         return {"UNIFI_OVERHAUL_SYSWRAPPER": self.syswrapper, "UNIFI_OVERHAUL_RUN": self.run_dir,
-                "FAKE_IW_LIVE": self.live}
+                "UNIFI_OVERHAUL_RADIO_POLL": str(self.POLL_SECONDS), "UNIFI_OVERHAUL_RADIO_WAIT": str(self.WAIT_SECONDS),
+                "FAKE_IW_LIVE": self.live, "FAKE_RADIO_BUSY": self.busy}
+
+    def set_busy(self, checks):
+        """
+        Make the radio manager report busy for the next few status checks.
+
+        Args:
+            checks (int): how many status checks report busy before it goes idle.
+
+        Returns:
+            None
+
+        Raises:
+            OSError: the counter file can't be written.
+        """
+
+        with open(self.busy, "w", encoding="utf-8") as handle:
+            handle.write(f"{checks}\n")
 
     def call_count(self):
         """

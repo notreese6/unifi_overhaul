@@ -263,8 +263,10 @@ so it can fix itself:
 
 This installs a systemd timer on the gateway that re-applies the root 90 seconds after every boot
 and every 5 minutes after that. Because `apply` changes nothing when the 2.4 GHz network is already
-there, a run that finds nothing wrong does nothing. It also keeps a copy of root's `authorized_keys`
-and puts back any key a firmware update removes.
+live, a run that finds nothing wrong does nothing. At boot the gateway's radio manager is still
+applying its own config and refuses changes, so `apply` waits (up to 2 minutes) for it to go idle
+first; if a change still fails, nothing is left half-done and the next run tries again. It also
+keeps a copy of root's `authorized_keys` and puts back any key a firmware update removes.
 
 | On the gateway | What it is |
 |---|---|

@@ -13,6 +13,8 @@ PREV=$CFG.unifi-overhaul.prev
 SYSWRAPPER=${UNIFI_OVERHAUL_SYSWRAPPER:-/usr/bin/syswrapper.sh}
 # The firmware's runtime state (uplink, mesh status); the tests point it at a temporary directory
 RUN_DIR=${UNIFI_OVERHAUL_RUN:-/var/run}
+# How long apply waits for a busy radio manager, and how often it checks (seconds)
+RADIO_WAIT=${UNIFI_OVERHAUL_RADIO_WAIT:-120}; RADIO_POLL=${UNIFI_OVERHAUL_RADIO_POLL:-5}
 # Self-heal on the gateway; /data survives firmware updates on UniFi OS. Overridable for the tests too.
 HEAL_DIR=${UNIFI_OVERHAUL_DATA:-/data/unifi-overhaul}; UNIT_DIR=${UNIFI_OVERHAUL_UNITS:-/etc/systemd/system}
 AUTH_KEYS=${UNIFI_OVERHAUL_AUTH_KEYS:-/root/.ssh/authorized_keys}; UNIT=unifi-overhaul-heal
@@ -248,6 +250,7 @@ do_diag(){
 
   diag_section "wireless"
   for c in "iw dev" "iw reg get" "iwconfig" "cat /proc/net/wireless" "diag_supplicants"; do diag_run "$c"; done
+  have radiomgrctl && diag_run "radiomgrctl status"
   for i in $(iwtree | awk '$1=="Interface"{print $2}'); do
     for c in info link "station dump" "survey dump" "scan dump"; do diag_run "iw dev $i $c"; done
     have wlanconfig && diag_run "wlanconfig $i list sta"
@@ -337,6 +340,26 @@ transform(){ out=$1; cp -f "$CFG" "$out"
   if { [ "$ROLE" = root ] || [ "$ROLE" = relay ] || [ "$WITH_AP" = 1 ]; } && ! has_24_downlink "$out"; then clone_ap "$out"; fi
   if { [ "$ROLE" = leaf ] || [ "$ROLE" = relay ]; } && [ "$(val "wireless.$STA_IDX.parent" "$out")" != wifi0 ]; then move_sta "$out"; fi; }
 same_file(){ if have cmp; then cmp -s "$1" "$2"; else diff "$1" "$2" >/dev/null 2>&1; fi; }
+# radiomgrd (UniFi OS) takes one config change at a time and refuses apply-config while it's mid-change, e.g.
+# finishing its own boot-time config. Firmware without radiomgrctl has nothing to wait for.
+radio_busy(){   # prints why the radio manager can't take a change right now; prints nothing when it can
+  have radiomgrctl || return 0
+  s=$(radiomgrctl status 2>/dev/null)
+  c=$(echo "$s" | sed -n 's/.*"controller_state": *"\([^"]*\)".*/\1/p' | head -n 1)
+  a=$(echo "$s" | sed -n 's/.*"apply_state": *"\([^"]*\)".*/\1/p' | head -n 1)
+  w=$(echo "$s" | sed -n 's/.*"walk_in_flight": *\([a-z]*\).*/\1/p' | head -n 1)
+  if [ "$c" = READY ] && [ "$a" = APPLY_IDLE ] && [ "$w" != true ]; then return 0; fi
+  echo "controller=${c:-?} apply=${a:-?} walk_in_flight=${w:-?}"; }
+wait_for_radio(){   # 0 once the radio manager can take a change; 1 if it's still busy after RADIO_WAIT seconds
+  waited=0
+  RADIO_STATE=$(radio_busy)
+  while [ -n "$RADIO_STATE" ]; do
+    if [ "$waited" -ge "$RADIO_WAIT" ]; then return 1; fi
+    if [ "$waited" -eq 0 ]; then log "[*] radio manager busy ($RADIO_STATE) -- waiting up to ${RADIO_WAIT}s"; fi
+    sleep "$RADIO_POLL"; waited=$((waited + RADIO_POLL))
+    RADIO_STATE=$(radio_busy)
+  done
+  return 0; }
 apply_cfg(){
   # syswrapper's own apply path: fast-apply when it can, and an AUTOMATIC full wifi restart for
   # changes fast-apply can't do (e.g. moving a vap between radios -- 'parent unhandled'). 'nopersist'
@@ -522,9 +545,19 @@ case "$MODE" in
     log "[*] role is autodetected from what's connected now (see 'status'); on a relay pass --with-ap,"
     log "    since an AP below it that's disconnected right now makes it look like a leaf." ;;
   apply) transform "$NEW"
+    is_pushing_again=no
     if same_file "$CFG" "$NEW"; then
       rm -f "${NEW:?}"
       if [ "$(change_applied)" = YES ]; then log "[+] already applied (role=$ROLE ch=$CH) -- nothing to change"; exit 0; fi
+      is_pushing_again=yes
+    fi
+    # Checked before the config is touched, so a busy radio manager leaves nothing to undo
+    if ! wait_for_radio; then
+      rm -f "${NEW:?}"
+      log "[-] the radio manager is still busy ($RADIO_STATE) after ${RADIO_WAIT}s, so nothing was changed -- run apply again shortly"
+      exit 1
+    fi
+    if [ "$is_pushing_again" = yes ]; then
       # The file has the change but the radio doesn't: an earlier apply-config failed, or something reloaded.
       # Nothing to put back if this push fails too, so drop any leftover copy from an interrupted run.
       rm -f "${PREV:?}"

@@ -123,6 +123,14 @@ class TestSelfHealScript(unittest.TestCase):
         self.assertTrue(os.path.exists(self.radio.live))
         self.assertEqual(downlinks_24(self.cfg), 1)
 
+    def test_heal_at_boot_waits_out_the_radio_managers_own_apply(self):
+        self.run_script("__install")
+        self.radio.set_busy(2)
+
+        self.run_script("__heal")
+        self.assertTrue(os.path.exists(self.radio.live))
+        self.assertEqual(self.radio.call_count(), 1)
+
     def test_heal_restores_a_wiped_key(self):
         self.run_script("__install")
         with open(self.auth_keys, "w", encoding="utf-8") as handle:

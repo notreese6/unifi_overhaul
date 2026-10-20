@@ -148,6 +148,24 @@ class TestApplyIsIdempotent(unittest.TestCase):
         self.assertEqual(downlinks_24(self.cfg), 1)
         self.assertTrue(os.path.exists(self.radio.live))
 
+    def test_waits_for_a_busy_radio_manager(self):
+        self.radio.set_busy(2)
+
+        output = self.run_script("apply", "--role", "root")
+
+        self.assertIn("radio manager busy", output)
+        self.assertEqual(self.radio.call_count(), 1)
+        self.assertEqual(downlinks_24(self.cfg), 1)
+
+    def test_gives_up_on_a_radio_manager_that_stays_busy(self):
+        self.radio.set_busy(100)
+
+        output = self.run_script("apply", "--role", "root", expect=1)
+
+        self.assertIn("still busy", output)
+        self.assertEqual(self.radio.call_count(), 0)
+        self.assertTrue(filecmp.cmp(self.cfg, FIXTURE, shallow=False))
+
     def test_change_in_the_file_but_not_live_is_pushed_again(self):
         self.run_script("apply", "--role", "root")
         after_first = read(self.cfg)

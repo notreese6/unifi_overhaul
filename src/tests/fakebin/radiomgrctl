@@ -1,0 +1,12 @@
+#!/bin/sh
+# Fake radiomgrctl for the tests: `status` reports the radio manager idle, or busy while the counter in the file
+# named by $FAKE_RADIO_BUSY is above zero. Each status call counts it down, like a boot-time apply finishing.
+[ "${1:-}" = status ] || { echo "fake radiomgrctl $*"; exit 0; }
+n=0
+if [ -n "${FAKE_RADIO_BUSY:-}" ] && [ -f "$FAKE_RADIO_BUSY" ]; then n=$(cat "$FAKE_RADIO_BUSY"); fi
+if [ "$n" -gt 0 ]; then
+  echo $((n - 1)) > "$FAKE_RADIO_BUSY"
+  printf '{\n  "controller_state": "RECONCILING",\n  "apply_state": "APPLY_COMMIT_PENDING",\n  "walk_in_flight": true\n}\n'
+else
+  printf '{\n  "controller_state": "READY",\n  "apply_state": "APPLY_IDLE",\n  "walk_in_flight": false\n}\n'
+fi
