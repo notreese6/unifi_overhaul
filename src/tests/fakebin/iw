@@ -1,6 +1,13 @@
 #!/bin/sh
-# Fake iw for the tests: one 2.4 GHz uplink interface, so the per-interface diagnostics loop runs.
+# Fake iw for the tests: one 2.4 GHz uplink interface, so the per-interface diagnostics loop runs. While the file
+# named by $FAKE_IW_LIVE exists, the 2.4 GHz change is live: a 2.4 GHz vwire AP is up and the uplink is on 2412 MHz.
+is_live(){ [ -n "${FAKE_IW_LIVE:-}" ] && [ -f "$FAKE_IW_LIVE" ]; }
 case "$*" in
-  dev) printf 'phy#0\n\tInterface vwiresta8\n\t\ttype managed\n\t\tchannel 1 (2412 MHz)\n' ;;
-  *)   echo "fake iw $*" ;;
+  dev)
+    printf 'phy#0\n\tInterface vwiresta8\n\t\ttype managed\n\t\tchannel 1 (2412 MHz)\n'
+    if is_live; then printf '\tInterface vwireap2\n\t\ttype AP\n\t\tchannel 1 (2412 MHz)\n'; fi ;;
+  "dev vwiresta8 link")
+    if is_live; then printf 'Connected to 02:00:00:00:01:24 (on vwiresta8)\n\tfreq: 2412\n'; else echo "Not connected."; fi ;;
+  *)
+    echo "fake iw $*" ;;
 esac

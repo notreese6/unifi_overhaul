@@ -1,5 +1,6 @@
 """
-unifi-overhaul.sh apply/dryrun/rollback against a fixture config and a fake syswrapper: re-applying changes nothing.
+unifi-overhaul.sh apply/dryrun/rollback against a fixture config and a fake radio: re-applying changes nothing,
+and a failed apply-config leaves nothing half-done.
 """
 
 import filecmp
@@ -11,7 +12,7 @@ import unittest
 
 from unifi_overhaul import client
 
-from tests.helpers import FAKEBIN, fake_path
+from tests.helpers import FakeRadio, fake_path
 
 FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "stock-leaf.cfg")
 
@@ -42,6 +43,24 @@ def downlinks_24(path):
                if entry.get("parent") == "wifi0" and entry.get("usage") == "downlink" and entry.get("vwire") == "enabled")
 
 
+def read(path):
+    """
+    A file's text.
+
+    Args:
+        path (str): the file.
+
+    Returns:
+        str: its contents.
+
+    Raises:
+        OSError: the file can't be read.
+    """
+
+    with open(path, encoding="utf-8") as handle:
+        return handle.read()
+
+
 class TestApplyIsIdempotent(unittest.TestCase):
     """
     apply only adds what's missing, keeps the first backup, and rollback still reaches the original.
@@ -50,76 +69,51 @@ class TestApplyIsIdempotent(unittest.TestCase):
     def setUp(self):
         self.folder = tempfile.mkdtemp()
         self.cfg    = os.path.join(self.folder, "system.cfg")
-        self.calls  = os.path.join(self.folder, "syswrapper.calls")
+        self.radio  = FakeRadio(self.folder)
         shutil.copy(FIXTURE, self.cfg)
 
-        fake_syswrapper = os.path.join(self.folder, "syswrapper.sh")
-        with open(fake_syswrapper, "w", encoding="utf-8") as handle:
-            handle.write(f'#!/bin/sh\necho "$@" >> {self.calls}\n')
-        os.chmod(fake_syswrapper, 0o755)
-
-        self.env = dict(os.environ, **fake_path(), UNIFI_OVERHAUL_CFG=self.cfg, UNIFI_OVERHAUL_SYSWRAPPER=fake_syswrapper)
+        self.env = dict(os.environ, **fake_path(), **self.radio.env(), UNIFI_OVERHAUL_CFG=self.cfg)
 
     def tearDown(self):
         shutil.rmtree(self.folder)
 
-    def run_script(self, *args):
+    def run_script(self, *args, expect=0):
         """
-        Run unifi-overhaul.sh with the fixture config and fake syswrapper.
+        Run unifi-overhaul.sh with the fixture config and the fake radio.
 
         Args:
             *args (str): the mode and options.
+            expect (int): the exit status the run must have.
 
         Returns:
             str: everything it printed.
 
         Raises:
-            AssertionError: it exited non-zero.
+            AssertionError: it exited with a different status.
         """
 
         result = subprocess.run(["sh", client.DEFAULT_SCRIPT, *args], env=self.env, capture_output=True, text=True,
                                 timeout=60)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.returncode, expect, result.stdout + result.stderr)
         return result.stdout
-
-    def syswrapper_calls(self):
-        """
-        How many times the fake syswrapper was run.
-
-        Args:
-            None
-
-        Returns:
-            int: the number of apply-config calls.
-
-        Raises:
-            None
-        """
-
-        if not os.path.exists(self.calls):
-            return 0
-        with open(self.calls, encoding="utf-8") as handle:
-            return len(handle.readlines())
 
     def test_relay_apply_adds_downlink_and_moves_uplink(self):
         self.run_script("apply", "--role", "relay", "--channel", "1")
 
         self.assertEqual(downlinks_24(self.cfg), 1)
-        with open(self.cfg, encoding="utf-8") as handle:
-            text = handle.read()
-        self.assertIn("wireless.9.parent=wifi0", text)
-        self.assertIn("radio.1.channel=1", text)
-        self.assertEqual(self.syswrapper_calls(), 1)
+        self.assertIn("wireless.9.parent=wifi0", read(self.cfg))
+        self.assertIn("radio.1.channel=1", read(self.cfg))
+        self.assertEqual(self.radio.call_count(), 1)
 
     def test_second_apply_changes_nothing(self):
         self.run_script("apply", "--role", "relay", "--channel", "1")
-        after_first = open(self.cfg, encoding="utf-8").read()
+        after_first = read(self.cfg)
 
         output = self.run_script("apply", "--role", "relay", "--channel", "1")
 
         self.assertIn("already applied", output)
-        self.assertEqual(open(self.cfg, encoding="utf-8").read(), after_first)
-        self.assertEqual(self.syswrapper_calls(), 1)
+        self.assertEqual(read(self.cfg), after_first)
+        self.assertEqual(self.radio.call_count(), 1)
 
     def test_root_applied_twice_has_one_downlink(self):
         self.run_script("apply", "--role", "root")
@@ -136,6 +130,33 @@ class TestApplyIsIdempotent(unittest.TestCase):
     def test_dryrun_after_apply_reports_nothing_to_do(self):
         self.run_script("apply", "--role", "relay")
         self.assertIn("apply would change nothing", self.run_script("dryrun", "--role", "relay"))
+
+    def test_failed_syswrapper_puts_the_config_back(self):
+        open(self.radio.fail, "w").close()
+
+        output = self.run_script("apply", "--role", "root", expect=1)
+
+        self.assertIn("config was put back", output)
+        self.assertTrue(filecmp.cmp(self.cfg, FIXTURE, shallow=False))
+
+    def test_retry_after_a_failure_applies(self):
+        open(self.radio.fail, "w").close()
+        self.run_script("apply", "--role", "root", expect=1)
+        os.remove(self.radio.fail)
+
+        self.run_script("apply", "--role", "root")
+        self.assertEqual(downlinks_24(self.cfg), 1)
+        self.assertTrue(os.path.exists(self.radio.live))
+
+    def test_change_in_the_file_but_not_live_is_pushed_again(self):
+        self.run_script("apply", "--role", "root")
+        after_first = read(self.cfg)
+        os.remove(self.radio.live)
+
+        self.assertIn("isn't live -- apply would push it again", self.run_script("dryrun", "--role", "root"))
+        self.assertIn("pushing it again", self.run_script("apply", "--role", "root"))
+        self.assertEqual(read(self.cfg), after_first)
+        self.assertEqual(self.radio.call_count(), 2)
 
     def test_backup_and_rollback_keep_the_original(self):
         self.run_script("apply", "--role", "leaf")

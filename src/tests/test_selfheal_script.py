@@ -1,18 +1,17 @@
 """
 The gateway self-heal modes of unifi-overhaul.sh (__install, __heal, __remove, and the probe's S line), run against
-temporary directories, a fake systemctl and a fake syswrapper, so nothing on the test machine is touched.
+temporary directories, a fake systemctl and a fake radio, so nothing on the test machine is touched.
 """
 
 import os
 import shutil
-import stat
 import subprocess
 import tempfile
 import unittest
 
 from unifi_overhaul import client
 
-from tests.helpers import fake_path
+from tests.helpers import FakeRadio, fake_path
 from tests.test_script import FIXTURE, downlinks_24
 
 KEY  = "ssh-rsa AAAAexamplekey unifi"
@@ -31,7 +30,7 @@ class TestSelfHealScript(unittest.TestCase):
         self.auth_keys = os.path.join(self.folder, "root", ".ssh", "authorized_keys")
         self.cfg       = os.path.join(self.folder, "system.cfg")
         self.calls     = os.path.join(self.folder, "systemctl.log")
-        self.applies   = os.path.join(self.folder, "syswrapper.log")
+        self.radio     = FakeRadio(self.folder)
 
         # What the client's install step does before running __install: copy the script into the data dir
         os.makedirs(self.heal_dir)
@@ -42,14 +41,9 @@ class TestSelfHealScript(unittest.TestCase):
             handle.write(KEY + "\n")
         shutil.copy(FIXTURE, self.cfg)
 
-        syswrapper = os.path.join(self.folder, "syswrapper.sh")
-        with open(syswrapper, "w", encoding="utf-8") as handle:
-            handle.write(f'#!/bin/sh\necho "$@" >> {self.applies}\n')
-        os.chmod(syswrapper, stat.S_IRWXU)
-
-        self.env = dict(os.environ, **fake_path(), UNIFI_OVERHAUL_DATA=self.heal_dir, UNIFI_OVERHAUL_UNITS=self.unit_dir,
-                        UNIFI_OVERHAUL_AUTH_KEYS=self.auth_keys, UNIFI_OVERHAUL_CFG=self.cfg,
-                        UNIFI_OVERHAUL_SYSWRAPPER=syswrapper, FAKE_SYSTEMCTL_LOG=self.calls)
+        self.env = dict(os.environ, **fake_path(), **self.radio.env(), UNIFI_OVERHAUL_DATA=self.heal_dir,
+                        UNIFI_OVERHAUL_UNITS=self.unit_dir, UNIFI_OVERHAUL_AUTH_KEYS=self.auth_keys,
+                        UNIFI_OVERHAUL_CFG=self.cfg, FAKE_SYSTEMCTL_LOG=self.calls)
 
     def tearDown(self):
         shutil.rmtree(self.folder)
@@ -116,7 +110,18 @@ class TestSelfHealScript(unittest.TestCase):
         self.assertIn("radio.1.channel=6", self.read(self.cfg))
 
         self.assertIn("already applied", self.run_script("__heal"))
-        self.assertEqual(len(self.read(self.applies).splitlines()), 1)
+        self.assertEqual(self.radio.call_count(), 1)
+
+    def test_heal_retries_after_apply_config_fails_at_boot(self):
+        self.run_script("__install")
+        open(self.radio.fail, "w").close()
+        self.assertIn("config was put back", self.run_script("__heal", expect=1))
+
+        # The next timer run, once the radio manager is ready
+        os.remove(self.radio.fail)
+        self.run_script("__heal")
+        self.assertTrue(os.path.exists(self.radio.live))
+        self.assertEqual(downlinks_24(self.cfg), 1)
 
     def test_heal_restores_a_wiped_key(self):
         self.run_script("__install")
@@ -131,7 +136,7 @@ class TestSelfHealScript(unittest.TestCase):
         os.remove(self.cfg)
 
         self.assertIn("not there yet", self.run_script("__heal"))
-        self.assertEqual(self.read(self.applies), "")
+        self.assertEqual(self.radio.call_count(), 0)
 
     def test_probe_reports_the_timer(self):
         self.assertIn("S absent", self.run_script("__probe"))

@@ -9,7 +9,10 @@
 set -u
 # The UNIFI_OVERHAUL_* overrides exist for the tests, which run this script against temporary files and fakes
 CFG=${UNIFI_OVERHAUL_CFG:-/tmp/system.cfg}; BAK=$CFG.unifi-overhaul.bak; NEW=$CFG.unifi-overhaul.new
+PREV=$CFG.unifi-overhaul.prev
 SYSWRAPPER=${UNIFI_OVERHAUL_SYSWRAPPER:-/usr/bin/syswrapper.sh}
+# The firmware's runtime state (uplink, mesh status); the tests point it at a temporary directory
+RUN_DIR=${UNIFI_OVERHAUL_RUN:-/var/run}
 # Self-heal on the gateway; /data survives firmware updates on UniFi OS. Overridable for the tests too.
 HEAL_DIR=${UNIFI_OVERHAUL_DATA:-/data/unifi-overhaul}; UNIT_DIR=${UNIFI_OVERHAUL_UNITS:-/etc/systemd/system}
 AUTH_KEYS=${UNIFI_OVERHAUL_AUTH_KEYS:-/root/.ssh/authorized_keys}; UNIT=unifi-overhaul-heal
@@ -117,7 +120,7 @@ do_probe(){   # machine-readable one-device summary for unifi-overhaul-client (r
   w=$(iw phy 2>/dev/null | grep -c "^Wiphy"); [ "$w" -gt 0 ] || w=$(ls -d /sys/class/net/wifi[0-9] 2>/dev/null | wc -l)
   echo "W $w"
   echo "S $(heal_state)"
-  up=$(cat /var/run/system.uplink 2>/dev/null); st=$(cat /var/run/system.uplink_ifname 2>/dev/null)
+  up=$(cat $RUN_DIR/system.uplink 2>/dev/null); st=$(cat $RUN_DIR/system.uplink_ifname 2>/dev/null)
   if [ "$up" = eth ] || [ -z "$st" ]; then echo "U WIRED - -"
   else
     l=$(iw dev "$st" link 2>/dev/null)
@@ -137,8 +140,8 @@ diag_run(){ printf '\n===== %s\n' "$1"; ( eval "$1" ) </dev/null 2>&1; printf --
 diag_section(){ printf '\n\n########## %s ##########\n' "$1"; }
 DIAG_EVENTS="configure_uplink|need_cfg_save|cfgmtd|STA_ASSOC|uplink-monitor|isolat|m3_dump|assert|recover|apply-config|provision|inform"
 diag_state_files(){
-  for f in /var/run/system.uplink /var/run/system.uplink_ifname /var/run/system.uplink.prev /var/run/uplink_eth \
-           /var/run/uplink_wds /var/run/uplink_bridge /var/run/mesh.status /var/run/need_cfg_save; do
+  for f in $RUN_DIR/system.uplink $RUN_DIR/system.uplink_ifname $RUN_DIR/system.uplink.prev $RUN_DIR/uplink_eth \
+           $RUN_DIR/uplink_wds $RUN_DIR/uplink_bridge $RUN_DIR/mesh.status $RUN_DIR/need_cfg_save; do
     [ -e "$f" ] && { echo "--- $f"; cat "$f"; }
   done; return 0; }
 diag_shell_history(){   # the exact apply commands run before, e.g. which --channel
@@ -154,10 +157,10 @@ diag_ping_gateway(){
   [ -n "$gw" ] || { echo "no default route"; return 1; }
   ping -c 10 -W 2 "$gw"; }
 diag_supplicants(){   # uplink STA and vwire AP state as wpa_supplicant/hostapd see it (status only; no keys)
-  for d in /var/run/wpa_supplicant*; do [ -d "$d" ] || continue
+  for d in $RUN_DIR/wpa_supplicant*; do [ -d "$d" ] || continue
     for s in "$d"/*; do echo "--- wpa_cli -p $d -i ${s##*/} status"; wpa_cli -p "$d" -i "${s##*/}" status 2>&1; done
   done
-  for d in /var/run/hostapd*; do [ -d "$d" ] || continue
+  for d in $RUN_DIR/hostapd*; do [ -d "$d" ] || continue
     for s in "$d"/*; do echo "--- hostapd_cli -p $d -i ${s##*/} status / all_sta"
       hostapd_cli -p "$d" -i "${s##*/}" status 2>&1; hostapd_cli -p "$d" -i "${s##*/}" all_sta 2>&1; done
   done; return 0; }
@@ -190,7 +193,7 @@ heal_state(){   # the gateway self-heal timer: active, inactive (installed but s
   systemctl is-active "$UNIT.timer" 2>/dev/null || true; }
 do_install(){   # gateway only: re-apply the root's 2.4 GHz backhaul after every boot and controller provision
   { have systemctl && [ -d "$(dirname "$HEAL_DIR")" ]; } || { log "[-] no systemd or no $(dirname "$HEAL_DIR") here -- self-heal is for the UniFi OS gateway only"; exit 1; }
-  if [ "$(cat /var/run/system.uplink 2>/dev/null)" = wds ]; then log "[-] this device uplinks wirelessly -- self-heal is for the wired gateway only"; exit 1; fi
+  if [ "$(cat $RUN_DIR/system.uplink 2>/dev/null)" = wds ]; then log "[-] this device uplinks wirelessly -- self-heal is for the wired gateway only"; exit 1; fi
   [ -f "$HEAL_DIR/unifi-overhaul.sh" ] || { log "[-] $HEAL_DIR/unifi-overhaul.sh missing -- install with unifi-overhaul-client --install-self-heal"; exit 1; }
   echo "CHANNEL=$CH" > "$HEAL_DIR/settings"
   # Snapshot root's keys, so a firmware update that wipes them doesn't end key-based ssh for good
@@ -289,7 +292,7 @@ detect(){
   n=2; while grep -q "devname=vwireap$n" "$CFG"; do n=$((n+1)); done; NEW_AP="vwireap$n"
   # role: root (wired), or leaf/relay (wireless uplink). relay = a leaf that other APs mesh through
   # (a downstream AP is associated to one of our vwire downlink APs).
-  up=$(cat /var/run/system.uplink 2>/dev/null)
+  up=$(cat $RUN_DIR/system.uplink 2>/dev/null)
   DOWN_N=0
   DOWN_N=$(list_downstream | grep -c .)
   # fallbacks (a marginal 4addr peer ages out of `list sta`): a vwireapN.staN interface, or a
@@ -341,15 +344,18 @@ apply_cfg(){
   # A full restart briefly drops ALL wifi (~20-30s).
   "$SYSWRAPPER" apply-config "$CFG" nopersist; }
 
-change_applied(){   # live ground-truth: is a 2.4GHz vwire in use on this device?
-  if [ "$ROLE" = root ]; then
-    for i in $(iwtree|awk '$1=="Interface"{print $2}'|grep '^vwireap'); do
-      f=$(freq_of "$i"); [ -n "$f" ] && [ "$f" -lt 2500 ] && { echo YES; return; }
-    done; echo no
-  else
-    st=$(cat /var/run/system.uplink_ifname 2>/dev/null)
-    f=$(link_freq "$st"); [ -n "$f" ] && [ "$f" -lt 2500 ] && echo YES || echo no
-  fi; }
+change_applied(){   # live ground-truth: root offers 2.4 GHz, leaf uplinks on it, relay does both
+  offers=no; uplink=no
+  for i in $(iwtree|awk '$1=="Interface"{print $2}'|grep '^vwireap'); do
+    f=$(freq_of "$i"); if [ -n "$f" ] && [ "$f" -lt 2500 ]; then offers=YES; fi
+  done
+  st=$(cat $RUN_DIR/system.uplink_ifname 2>/dev/null)
+  f=$(link_freq "$st"); if [ -n "$f" ] && [ "$f" -lt 2500 ]; then uplink=YES; fi
+  case "$ROLE" in
+    root)  echo "$offers" ;;
+    relay) if [ "$offers" = YES ] && [ "$uplink" = YES ]; then echo YES; else echo no; fi ;;
+    *)     echo "$uplink" ;;
+  esac; }
 
 
 show_status(){
@@ -360,7 +366,7 @@ show_status(){
   echo ""
   echo "[*] Place in mesh chain   (uplink -> self -> downlink; [local: iface=name] = how neighbours see this end)"
   # uplink: who this device connects UP to. [local:...] is the name up-chain devices see it by.
-  st=$(cat /var/run/system.uplink_ifname 2>/dev/null)
+  st=$(cat $RUN_DIR/system.uplink_ifname 2>/dev/null)
   if [ -n "$st" ] && [ -e "/sys/class/net/$st" ]; then
     l=$(iw dev "$st" link 2>/dev/null); ub=$(echo "$l"|awk '/Connected to/{print $3;exit}')
     uf=$(echo "$l"|awk '$1=="freq:"{print $2;exit}'); us=$(echo "$l"|awk '$1=="signal:"{print $2;exit}')
@@ -368,7 +374,7 @@ show_status(){
     om=$(cat /sys/class/net/$st/address 2>/dev/null)
     if [ -n "$ub" ]; then echo "      uplink    $(mac_name "$ub") ($ub)   [$(band_of "$uf") ${us}dBm  rx/tx $(rate_h "${urx:-?}")/$(rate_h "${utx:-?}")]   [local: $st=$(mac_name "$om")]"
     else echo "      uplink    $st -- NOT ASSOCIATED"; fi
-  elif [ "$(cat /var/run/system.uplink 2>/dev/null)" = eth ]; then
+  elif [ "$(cat $RUN_DIR/system.uplink 2>/dev/null)" = eth ]; then
     echo "      uplink    WIRED  (gateway / root)"
   else echo "      uplink    (none)"; fi
   # self: the one stable identity is the hostname (each vwire iface has its own MAC/name)
@@ -387,11 +393,11 @@ show_status(){
     else echo "      downlink  (none -- end leaf)"; fi
   fi
   echo ""
-  ui=$(cat /var/run/uplink_wds 2>/dev/null)
+  ui=$(cat $RUN_DIR/uplink_wds 2>/dev/null)
   # only show uplink_iface when there is one -- a wired root has no wireless uplink interface, so the field would be blank
-  echo "[*] mca (Management Console Agent): uplink=$(cat /var/run/system.uplink 2>/dev/null)${ui:+  uplink_iface=$ui}"
-  gw=$(awk -F= '/^gateway=/{print $2}' /var/run/mesh.status 2>/dev/null)
-  um=$(awk -F= '/^uplink_mac=/{print $2}' /var/run/mesh.status 2>/dev/null)
+  echo "[*] mca (Management Console Agent): uplink=$(cat $RUN_DIR/system.uplink 2>/dev/null)${ui:+  uplink_iface=$ui}"
+  gw=$(awk -F= '/^gateway=/{print $2}' $RUN_DIR/mesh.status 2>/dev/null)
+  um=$(awk -F= '/^uplink_mac=/{print $2}' $RUN_DIR/mesh.status 2>/dev/null)
   # mesh.status 'uplink_mac' is the GATEWAY / mesh-root MAC (its base MAC), not the immediate uplink
   [ -n "$gw" ] && echo "[*] mca: gateway=$gw${um:+  gateway_mac=$um ($(mac_name "$um"))}"
   echo "[*] backhaul SSID (vwire): $MESH_SSID"
@@ -431,7 +437,7 @@ show_avail(){
   # 1) show the CURRENT uplink signal live (no scan -- always safe, whatever band you're on)
   # 2) to show what's available if you SWITCH, scan the bands you're NOT on -- but that scan can
   #    drop a weak/multi-hop backhaul (chip-coupled WiFi7 radios), so it's gated behind a prompt.
-  st=$(cat /var/run/system.uplink_ifname 2>/dev/null); uphy=""; uf=""
+  st=$(cat $RUN_DIR/system.uplink_ifname 2>/dev/null); uphy=""; uf=""
   if [ -n "$st" ] && [ -e "/sys/class/net/$st" ]; then
     uphy=$(cat /sys/class/net/$st/phy80211/name 2>/dev/null)
     l=$(iw dev "$st" link 2>/dev/null)
@@ -496,7 +502,12 @@ case "$MODE" in
   status) show_status ;;
   avail)  show_avail ;;
   dryrun) transform "$NEW"
-    if same_file "$CFG" "$NEW"; then rm -f "${NEW:?}"; log "[+] already applied (role=$ROLE ch=$CH) -- apply would change nothing"; exit 0; fi
+    if same_file "$CFG" "$NEW"; then
+      rm -f "${NEW:?}"
+      if [ "$(change_applied)" = YES ]; then log "[+] already applied (role=$ROLE ch=$CH) -- apply would change nothing"
+      else log "[*] the config already has the change but it isn't live -- apply would push it again"; fi
+      exit 0
+    fi
     if command -v diff >/dev/null 2>&1; then diff -u "$CFG" "$NEW"
     else log "ADDED:"; grep -vxF -f "$CFG" "$NEW"; log "REMOVED:"; grep -vxF -f "$NEW" "$CFG"; fi
     rm -f "${NEW:?}"
@@ -511,11 +522,26 @@ case "$MODE" in
     log "[*] role is autodetected from what's connected now (see 'status'); on a relay pass --with-ap,"
     log "    since an AP below it that's disconnected right now makes it look like a leaf." ;;
   apply) transform "$NEW"
-    if same_file "$CFG" "$NEW"; then rm -f "${NEW:?}"; log "[+] already applied (role=$ROLE ch=$CH) -- nothing to change"; exit 0; fi
-    # Keep the first pre-apply config of this boot, so rollback still reaches stock after a second apply
-    [ -f "$BAK" ] || cp -f "$CFG" "$BAK"; log "[+] backup: $BAK"; mv -f "$NEW" "$CFG"
+    if same_file "$CFG" "$NEW"; then
+      rm -f "${NEW:?}"
+      if [ "$(change_applied)" = YES ]; then log "[+] already applied (role=$ROLE ch=$CH) -- nothing to change"; exit 0; fi
+      # The file has the change but the radio doesn't: an earlier apply-config failed, or something reloaded.
+      # Nothing to put back if this push fails too, so drop any leftover copy from an interrupted run.
+      rm -f "${PREV:?}"
+      log "[*] the config already has the change but it isn't live -- pushing it again"
+    else
+      # Keep the first pre-apply config of this boot, so rollback still reaches stock after a second apply
+      [ -f "$BAK" ] || cp -f "$CFG" "$BAK"; log "[+] backup: $BAK"
+      cp -f "$CFG" "$PREV"; mv -f "$NEW" "$CFG"
+    fi
     log "[*] applying via syswrapper (a vap moving radios triggers a full wifi restart -- all wifi drops ~20-30s)..."
-    apply_cfg
+    if ! apply_cfg; then
+      # Put the file back, so the next run retries instead of finding an edit the radio never got
+      if [ -f "$PREV" ]; then mv -f "$PREV" "$CFG"; fi
+      log "[-] syswrapper failed, so the config was put back and nothing changed -- run apply again in a minute"
+      exit 1
+    fi
+    rm -f "${PREV:?}"
     log "[+] apply issued. wait ~30s for wifi to settle, then run: /tmp/unifi-overhaul.sh status"
     if [ "$ROLE" = leaf ]; then log "[-] if this AP stays silent past ~1min, power-cycle it; if it still can't connect, see the README's Recovery"; fi ;;
   rollback) if [ -f "$BAK" ]; then cp -f "$BAK" "$CFG"; log "[*] restoring backup + applying..."; apply_cfg
