@@ -131,21 +131,26 @@ def discovered_targets(args, explicit_ips):
 
     print(f"[*] discovering UniFi devices (UDP {client.DISCOVERY_PORT} broadcast to {args.broadcast}, "
           f"{args.timeout:g}s) ...", file=sys.stderr)
-    known   = set(explicit_ips)
-    targets = []
+    known      = set(explicit_ips)
+    known_macs = set()
+    targets    = []
 
     for found in client.discover(args.broadcast, args.timeout):
         if found.ip not in known:
             known.add(found.ip)
+            known_macs.add(found.mac)
             targets.append(discovered_target(args, found))
 
     gateways = [target for target in targets if target.found.is_gateway]
     script   = read_script(args.script) if gateways else b""
     for gateway in gateways:
         for found in controller_devices(gateway, script):
-            if found.ip not in known:
-                known.add(found.ip)
-                targets.append(discovered_target(args, found))
+            # The controller lists the gateway itself too, under its WAN address, so match devices by MAC as well
+            if found.ip in known or found.mac in known_macs:
+                continue
+            known.add(found.ip)
+            known_macs.add(found.mac)
+            targets.append(discovered_target(args, found))
 
     print(f"[*] discovery found {len(targets)} device(s) not already listed", file=sys.stderr)
     return targets

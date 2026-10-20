@@ -39,10 +39,11 @@ class Step:
     The verdict for one device: what it needs and why.
     """
 
-    node:   object    # topology.Node
-    role:   Role
-    action: Action
-    reason: str
+    node:        object    # topology.Node
+    role:        Role
+    action:      Action
+    reason:      str
+    parent_mac:  str = ""  # base MAC of the intended parent, for apply --parent; "" when unknown or the root
 
     @property
     def line(self):
@@ -87,6 +88,22 @@ class Observation:
 
         parent = self.mesh.parent(self.devices[name])
         return next((other for other, dev in self.devices.items() if dev is parent), "")
+
+    def name_of(self, base_mac):
+        """
+        Which mesh.ini device has this base MAC.
+
+        Args:
+            base_mac (str): a device's base MAC, lowercase.
+
+        Returns:
+            str: the device's mesh.ini name, or "" when no probed device has it.
+
+        Raises:
+            None
+        """
+
+        return next((name for name, dev in self.devices.items() if base_mac and dev.base_mac == base_mac), "")
 
 
 def target_for(node):
@@ -136,8 +153,9 @@ def decide(topology, node, observation):
         observation (Observation): the live state.
 
     Returns:
-        Step: NONE when it matches; APPLY when its 2.4 GHz uplink or downlink is missing; RECONNECT when it's
-        on 2.4 GHz but connected to the wrong parent; BLOCKED when it can't be reached.
+        Step: NONE when it matches; APPLY when its 2.4 GHz uplink or downlink is missing, or its config prefers a
+        parent other than mesh.ini's; RECONNECT when it's on 2.4 GHz but connected to the wrong parent; BLOCKED
+        when it can't be reached.
 
     Raises:
         None
@@ -153,20 +171,27 @@ def decide(topology, node, observation):
             return Step(node, role, Action.NONE, "offering 2.4 GHz")
         return Step(node, role, Action.APPLY, "not offering 2.4 GHz")
 
+    # The parent's base MAC is only known when the parent answered a probe from a script that reports it
+    parent     = observation.devices.get(node.parent)
+    parent_mac = parent.base_mac if parent is not None and parent.is_reachable else ""
+
     missing = []
     if dev.uplink_band != client.BAND_24:
         missing.append(f"uplink on {dev.uplink_band if dev.uplink_band not in ('', '?') else 'nothing'}")
     if role is Role.RELAY and not dev.has_downlink_24:
         children = ", ".join(child.name for child in topology.children(node))
         missing.append(f"not offering 2.4 GHz to {children}")
+    if parent_mac and dev.prefers != parent_mac:
+        preferred = observation.name_of(dev.prefers) or dev.prefers or "no parent"
+        missing.append(f"prefers {preferred} as its parent, mesh.ini says {node.parent}")
     if missing:
-        return Step(node, role, Action.APPLY, "; ".join(missing))
+        return Step(node, role, Action.APPLY, "; ".join(missing), parent_mac)
 
     actual = observation.parent_name(node.name)
     if actual != node.parent:
         return Step(node, role, Action.RECONNECT,
-                    f"connected to {actual or 'a device not in mesh.ini'}, mesh.ini says {node.parent}")
-    return Step(node, role, Action.NONE, f"on 2.4 GHz under {node.parent} ({dev.uplink_signal} dBm)")
+                    f"connected to {actual or 'a device not in mesh.ini'}, mesh.ini says {node.parent}", parent_mac)
+    return Step(node, role, Action.NONE, f"on 2.4 GHz under {node.parent} ({dev.uplink_signal} dBm)", parent_mac)
 
 
 def plan(topology, observation):
@@ -245,7 +270,9 @@ def perform(step, topology, script):
     # need an apply for other reasons would move and the chain would split across two channels. Changing the
     # channel of an applied mesh needs every device moved together, with the STAs following, and isn't built.
     options = f"--role {step.role.value} --channel {topology.channel}"
-    run     = client.run_ssh(target, client.apply_remote_command(options), script, timeout=SSH_ACTION_TIMEOUT)
+    if step.parent_mac:
+        options += f" --parent {step.parent_mac}"
+    run = client.run_ssh(target, client.apply_remote_command(options), script, timeout=SSH_ACTION_TIMEOUT)
     if run.returncode != 0:
         reason = run.stderr.strip().splitlines()
         return reason[-1] if reason else f"ssh exited {run.returncode}"
@@ -335,7 +362,9 @@ def stop(step, what):
 
 def settle(runner, topology, node, step):
     """
-    Bring one device in line: wait out an unreachable spell, act if needed, then wait for it to match.
+    Bring one device in line: wait out an unreachable spell, then act until it matches. A device can need an
+    apply and then a reboot (pinned to the right parent, but still connected to the wrong one); each action is
+    taken at most once, so one that doesn't help stops the run instead of repeating.
 
     Args:
         runner (Runner): how to observe, act and wait.
@@ -356,20 +385,24 @@ def settle(runner, topology, node, step):
         if step.action is Action.BLOCKED:
             return stop(step, "still unreachable")
 
-    if step.action is Action.NONE:
-        print(f"[+] {step.line}")
-        return None
+    taken = []
+    while step.action in [Action.APPLY, Action.RECONNECT]:
+        if step.action in taken:
+            return stop(step, f"still needs {step.action.value} after one")
+        taken.append(step.action)
 
-    print(f"[*] {step.line}")
-    failure = runner.perform(step)
-    if failure:
-        return stop(step, f"couldn't start {step.action.value}: {failure}")
+        print(f"[*] {step.line}")
+        failure = runner.perform(step)
+        if failure:
+            return stop(step, f"couldn't start {step.action.value}: {failure}")
 
-    timeout = RECONNECT_SETTLE if step.action is Action.RECONNECT else APPLY_SETTLE
-    print(f"[*] {node.name}: waiting up to {timeout}s for it to settle ...")
-    step = runner.wait_for(topology, node, lambda s: s.action is Action.NONE, timeout)
-    if step.action is not Action.NONE:
-        return stop(step, f"didn't settle within {timeout}s")
+        done    = step.action
+        timeout = RECONNECT_SETTLE if done is Action.RECONNECT else APPLY_SETTLE
+        print(f"[*] {node.name}: waiting up to {timeout}s for it to settle ...")
+        # Unreachable is expected while it restarts, so wait for a verdict that is neither that nor the same need
+        step = runner.wait_for(topology, node, lambda s: s.action not in [done, Action.BLOCKED], timeout)
+        if step.action in [done, Action.BLOCKED]:
+            return stop(step, f"didn't settle within {timeout}s")
 
     print(f"[+] {step.line}")
     return None

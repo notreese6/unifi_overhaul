@@ -20,12 +20,15 @@ HEAL_DIR=${UNIFI_OVERHAUL_DATA:-/data/unifi-overhaul}; UNIT_DIR=${UNIFI_OVERHAUL
 AUTH_KEYS=${UNIFI_OVERHAUL_AUTH_KEYS:-/root/.ssh/authorized_keys}; UNIT=unifi-overhaul-heal
 # The only files self-heal creates in HEAL_DIR; removal deletes exactly these and nothing else
 HEAL_FILES="unifi-overhaul.sh settings authorized_keys"
-CH=1; ROLE=""; WITH_AP=0; FORCE=0
+# The device identity file (base MAC); overridable for the tests
+BOARD=${UNIFI_OVERHAUL_BOARD:-/proc/ubnthal/board}
+CH=1; ROLE=""; WITH_AP=0; FORCE=0; PARENT=""
 MODE="${1:-status}"; [ $# -gt 0 ] && shift
 # the whole-mesh view lives in the python unifi-overhaul-client, which runs only on your workstation
 case "$MODE" in map) echo "[-] map moved to unifi-overhaul-client (python, run it on your workstation, not on a device)"; exit 2 ;; esac
 while [ $# -gt 0 ]; do case "$1" in
   --role) ROLE="$2"; shift 2 ;; --channel) CH="$2"; shift 2 ;; --with-ap) WITH_AP=1; shift ;;
+  --parent) PARENT=$(echo "$2" | tr A-F a-f); shift 2 ;;
   --force) FORCE=1; shift ;;
   *) echo "[-] unknown arg: $1"; exit 2 ;; esac; done
 
@@ -48,6 +51,7 @@ Usage: unifi-overhaul.sh [MODE] [options]
   options:
     --role root|leaf|relay   override the autodetected role
     --channel N              2.4 GHz channel (default 1); MUST match on every device
+    --parent MAC             prefer this parent (its base MAC, as `status` shows it) when picking an uplink
     --with-ap                offer a 2.4 GHz downlink; use on every relay (detection can't see APs
                              that aren't connected yet, e.g. after an outage)
     --force                  skip the avail scan confirmation prompt
@@ -122,6 +126,9 @@ do_probe(){   # machine-readable one-device summary for unifi-overhaul-client (r
   w=$(iw phy 2>/dev/null | grep -c "^Wiphy"); [ "$w" -gt 0 ] || w=$(ls -d /sys/class/net/wifi[0-9] 2>/dev/null | wc -l)
   echo "W $w"
   echo "S $(heal_state)"
+  # Base MAC, and the parent this device's config prefers (mesh.serial1, which the uplink choice weighs)
+  echo "B $(awk -F= '/^hwaddrbbase=/{print $2}' "$BOARD" 2>/dev/null | tr A-F a-f)"
+  echo "P $(val mesh.serial1 "$CFG" 2>/dev/null | tr A-F a-f)"
   up=$(cat $RUN_DIR/system.uplink 2>/dev/null); st=$(cat $RUN_DIR/system.uplink_ifname 2>/dev/null)
   if [ "$up" = eth ] || [ -z "$st" ]; then echo "U WIRED - -"
   else
@@ -338,7 +345,10 @@ transform(){ out=$1; cp -f "$CFG" "$out"
   set_kv radio.1.channel "$CH" "$out"
   # root & relay OFFER a 2.4 downlink (clone AP); leaf & relay MOVE their uplink STA to 2.4
   if { [ "$ROLE" = root ] || [ "$ROLE" = relay ] || [ "$WITH_AP" = 1 ]; } && ! has_24_downlink "$out"; then clone_ap "$out"; fi
-  if { [ "$ROLE" = leaf ] || [ "$ROLE" = relay ]; } && [ "$(val "wireless.$STA_IDX.parent" "$out")" != wifi0 ]; then move_sta "$out"; fi; }
+  if { [ "$ROLE" = leaf ] || [ "$ROLE" = relay ]; } && [ "$(val "wireless.$STA_IDX.parent" "$out")" != wifi0 ]; then move_sta "$out"; fi
+  # The controller writes mesh.serial1 from the uplink it last saw; pointing it at the intended parent makes the
+  # uplink prefer that parent instead of whichever one it happened to latch onto
+  if [ -n "$PARENT" ] && [ "$ROLE" != root ]; then set_kv mesh.serial1 "$PARENT" "$out"; fi; }
 same_file(){ if have cmp; then cmp -s "$1" "$2"; else diff "$1" "$2" >/dev/null 2>&1; fi; }
 # radiomgrd (UniFi OS) takes one config change at a time and refuses apply-config while it's mid-change, e.g.
 # finishing its own boot-time config. Firmware without radiomgrctl has nothing to wait for.
@@ -383,7 +393,7 @@ change_applied(){   # live ground-truth: root offers 2.4 GHz, leaf uplinks on it
 
 show_status(){
   host=$(cat /proc/sys/kernel/hostname 2>/dev/null)
-  basemac=$(awk -F= '/^hwaddrbbase=/{print $2}' /proc/ubnthal/board 2>/dev/null)   # canonical device MAC
+  basemac=$(awk -F= '/^hwaddrbbase=/{print $2}' "$BOARD" 2>/dev/null)   # canonical device MAC
   echo "==== unifi-overhaul status: ${host:-?}  (role=$ROLE) ===="
   echo "[*] 2.4GHz backhaul in use here (live): $(change_applied)"
   echo ""

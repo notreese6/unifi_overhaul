@@ -195,6 +195,12 @@ settle, it stops there and says why, leaving everything below it alone. A device
 right is skipped, so `--apply` is safe to run any time: after a power cut, a trip, or whenever
 the map shows something wrong. `--yes` skips the question.
 
+It also points each AP at its `mesh.ini` parent. An AP's config names a preferred parent
+(`mesh.serial1`), which its uplink weighs when choosing between parents. The controller fills
+that in from whichever parent the AP was last connected to, so an AP that once latched onto the
+wrong parent keeps being nudged back to it. `--apply` sets it to the right one, and reboots an AP
+that's still on the wrong parent so it chooses again.
+
 Each change restarts wifi on that device for 20–30 seconds, so run it from a computer that isn't
 connected *through* the APs being changed, ideally one wired to the gateway.
 

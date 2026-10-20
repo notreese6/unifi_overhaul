@@ -55,12 +55,18 @@ class TestDiscoveredTargets(unittest.TestCase):
     """
 
     def test_controller_adds_the_aps_the_broadcast_missed(self):
-        gateway = client.DiscoveredDevice(ip="127.0.0.2", platform="UDR", hostname="gateway")
+        gateway = client.DiscoveredDevice(ip="127.0.0.2", mac="02:00:00:00:01:00", platform="UDR", hostname="gateway")
         with mock.patch.object(client, "discover", return_value=[gateway]):
             targets = cli.discovered_targets(args(), explicit_ips=set())
 
-        self.assertEqual([t.ssh_target for t in targets],
-                         ["root@127.0.0.2", "root@192.0.2.1", "apuser@192.0.2.20", "apuser@192.0.2.21"])
+        self.assertEqual([t.ssh_target for t in targets], ["root@127.0.0.2", "apuser@192.0.2.20", "apuser@192.0.2.21"])
+
+    def test_gateway_listed_under_its_wan_address_is_not_added_again(self):
+        gateway = client.DiscoveredDevice(ip="127.0.0.2", mac="02:00:00:00:01:00", platform="UDR")
+        with mock.patch.object(client, "discover", return_value=[gateway]):
+            targets = cli.discovered_targets(args(), explicit_ips=set())
+
+        self.assertNotIn("root@198.51.100.7", [t.ssh_target for t in targets])
 
     def test_listed_ips_are_not_added_twice(self):
         gateway = client.DiscoveredDevice(ip="127.0.0.2", platform="UDR")

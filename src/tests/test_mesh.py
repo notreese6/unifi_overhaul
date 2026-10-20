@@ -64,6 +64,10 @@ class TestParseProbe(unittest.TestCase):
         self.assertEqual(dev.aps, [(RELAY_24, "2.4GHz")])
         self.assertEqual(dev.wifi_radios, 3)
 
+    def test_base_mac_and_preferred_parent(self):
+        dev = device("192.0.2.21", "H pro\nW 3\nU 02:00:00:00:02:24 2.4GHz -53\nB 02:00:00:00:03:00\nP 02:00:00:00:02:00")
+        self.assertEqual((dev.base_mac, dev.prefers), ("02:00:00:00:03:00", "02:00:00:00:02:00"))
+
     def test_switch_has_no_wifi(self):
         self.assertFalse(device("192.0.2.2", "H switch\nW 0\nU WIRED - -").has_wifi)
 

@@ -1,7 +1,8 @@
 #!/bin/sh
 # Fake mongo shell for the tests: the controller's adopted devices, as unifi-overhaul.sh __devices asks for them.
-# One device has no IP (offline) and one has no name, as the real database can.
-printf 'D\t192.0.2.1\t02:00:00:00:01:00\tudm\tUDR\tgateway\n'
+# The gateway's own record carries its WAN address (as the real one does), one device has no IP (offline), and one
+# has no name.
+printf 'D\t198.51.100.7\t02:00:00:00:01:00\tudm\tUDR\tgateway\n'
 printf 'D\t192.0.2.20\t02:00:00:00:02:00\tuap\tUAPX\tap hall\n'
 printf 'D\t192.0.2.21\t02:00:00:00:03:00\tuap\tUAPX\tundefined\n'
 printf 'D\tundefined\t02:00:00:00:04:00\tuap\tUAPX\tap-offline\n'

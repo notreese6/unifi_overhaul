@@ -176,6 +176,17 @@ class TestApplyIsIdempotent(unittest.TestCase):
         self.assertEqual(read(self.cfg), after_first)
         self.assertEqual(self.radio.call_count(), 2)
 
+    def test_parent_pins_the_preferred_uplink(self):
+        self.run_script("apply", "--role", "leaf", "--parent", "02:00:00:00:02:00")
+        self.assertIn("mesh.serial1=02:00:00:00:02:00", read(self.cfg))
+
+        self.assertIn("already applied", self.run_script("apply", "--role", "leaf", "--parent", "02:00:00:00:02:00"))
+        self.assertEqual(self.radio.call_count(), 1)
+
+    def test_root_ignores_parent(self):
+        self.run_script("apply", "--role", "root", "--parent", "02:00:00:00:02:00")
+        self.assertIn("mesh.serial1=02:00:00:00:01:00", read(self.cfg))
+
     def test_backup_and_rollback_keep_the_original(self):
         self.run_script("apply", "--role", "leaf")
         self.run_script("apply", "--role", "relay")

@@ -294,6 +294,8 @@ class Device:
     aps:           list = field(default_factory=list)  # (mac, band) of each vwire AP it offers
     wifi_radios:   int = -1         # -1 = the probe didn't say (an older unifi-overhaul.sh)
     self_heal:     str = ""         # gateway self-heal timer: active / inactive / absent; "" = not reported
+    base_mac:      str = ""         # the device's own MAC, as the controller and mesh.serial1 name it
+    prefers:       str = ""         # base MAC of the parent its config prefers (mesh.serial1); "" = none set
     error:         str = ""
 
     @property
@@ -812,6 +814,10 @@ def parse_probe(target, output):
             dev.wifi_radios = int(fields[1])
         elif kind == "S" and len(fields) >= 2:
             dev.self_heal = fields[1]
+        elif kind == "B" and len(fields) >= 2:
+            dev.base_mac = fields[1].lower()
+        elif kind == "P" and len(fields) >= 2:
+            dev.prefers = fields[1].lower()
 
     # The uplink BSSID has to match the AP MACs case-for-case to join the tree
     dev.uplink = dev.uplink.lower() if dev.uplink not in ("WIRED", "NONE") else dev.uplink

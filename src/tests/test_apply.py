@@ -3,6 +3,7 @@
 """
 
 import unittest
+from unittest import mock
 
 from unifi_overhaul import apply as mesh_apply
 from unifi_overhaul import client
@@ -44,8 +45,8 @@ class FakeMesh:
 
         Args:
             probes (dict[str, str | None]): __probe output per device name; None means unreachable.
-            fixes (dict[str, dict[str, str | None]] | None): per device, the probes to switch to once it's acted
-                on; a device missing here doesn't change when acted on.
+            fixes (dict[str, dict | list[dict]] | None): per device, the probes to switch to once it's acted on, or
+                a list of them applied one per action; a device missing here doesn't change when acted on.
 
         Returns:
             None
@@ -57,6 +58,7 @@ class FakeMesh:
         self.probes  = dict(probes)
         self.fixes   = fixes or {}
         self.actions = []
+        self.steps   = []
 
     def observe(self):
         """
@@ -96,7 +98,11 @@ class FakeMesh:
         """
 
         self.actions.append((step.node.name, step.action))
-        self.probes.update(self.fixes.get(step.node.name, {}))
+        self.steps.append(step)
+        fix = self.fixes.get(step.node.name, {})
+        if isinstance(fix, list):
+            fix = fix.pop(0) if fix else {}
+        self.probes.update(fix)
         return ""
 
 
@@ -144,6 +150,15 @@ HALL_RELAY       = f"H ap-hall\nW 3\nU {ROOT_24} 2.4GHz -60\nA {HALL_5} 5GHz\nA 
 HALL_AS_LEAF     = f"H ap-hall\nW 3\nU {ROOT_24} 2.4GHz -60\nA {HALL_5} 5GHz"
 FAR_UNDER_HALL   = "H ap-far\nW 3\nU {} 2.4GHz -53".format(HALL_24)
 FAR_UNDER_ROOT   = "H ap-far\nW 3\nU {} 2.4GHz -78".format(ROOT_24)
+
+# The same devices with base MACs and the parent each config prefers (mesh.serial1), as newer probes report them
+ROOT_BASE        = "02:00:00:00:01:00"
+HALL_BASE        = "02:00:00:00:02:00"
+GATEWAY_B        = GATEWAY_LIVE + f"\nB {ROOT_BASE}\nP "
+HALL_B           = HALL_RELAY + f"\nB {HALL_BASE}\nP {ROOT_BASE}"
+FAR_PINNED_ROOT  = FAR_UNDER_ROOT + f"\nB 02:00:00:00:03:00\nP {ROOT_BASE}"
+FAR_PINNED_HALL  = FAR_UNDER_ROOT + f"\nB 02:00:00:00:03:00\nP {HALL_BASE}"
+FAR_HOME         = FAR_UNDER_HALL + f"\nB 02:00:00:00:03:00\nP {HALL_BASE}"
 
 
 def runner(fake, answer=True):
@@ -202,6 +217,55 @@ class TestDecide(unittest.TestCase):
         lines = mesh_apply.warnings(chain(), fake.observe())
         self.assertTrue(any("ap-far is connected to gateway, mesh.ini says ap-hall" in line for line in lines))
         self.assertTrue(any("ap-far's uplink is weak (-78 dBm" in line for line in lines))
+
+
+class TestPinning(unittest.TestCase):
+    """
+    mesh.serial1: a device whose config prefers the wrong parent gets pinned to mesh.ini's, then moved there.
+    """
+
+    def test_wrong_preference_is_an_apply_with_the_parent_mac(self):
+        fake = FakeMesh({"gateway": GATEWAY_B, "ap-hall": HALL_B, "ap-far": FAR_PINNED_ROOT})
+        step = mesh_apply.decide(chain(), chain().node("ap-far"), fake.observe())
+
+        self.assertEqual(step.action, mesh_apply.Action.APPLY)
+        self.assertIn("prefers gateway as its parent, mesh.ini says ap-hall", step.reason)
+        self.assertEqual(step.parent_mac, HALL_BASE)
+
+    def test_pinned_but_on_the_wrong_parent_is_a_reboot(self):
+        fake = FakeMesh({"gateway": GATEWAY_B, "ap-hall": HALL_B, "ap-far": FAR_PINNED_HALL})
+        step = mesh_apply.decide(chain(), chain().node("ap-far"), fake.observe())
+        self.assertEqual(step.action, mesh_apply.Action.RECONNECT)
+
+    def test_older_probes_without_macs_skip_the_pin_check(self):
+        fake = FakeMesh({"gateway": GATEWAY_LIVE, "ap-hall": HALL_RELAY, "ap-far": FAR_UNDER_HALL})
+        self.assertEqual(mesh_apply.decide(chain(), chain().node("ap-far"), fake.observe()).action, mesh_apply.Action.NONE)
+
+    def test_pins_then_reboots_onto_the_right_parent(self):
+        fake   = FakeMesh({"gateway": GATEWAY_B, "ap-hall": HALL_B, "ap-far": FAR_PINNED_ROOT},
+                          fixes={"ap-far": [{"ap-far": FAR_PINNED_HALL}, {"ap-far": FAR_HOME}]})
+        status = mesh_apply.run(chain(), runner(fake))
+
+        self.assertEqual(status, client.ExitStatus.ALL_LIVE)
+        self.assertEqual(fake.actions, [("ap-far", mesh_apply.Action.APPLY), ("ap-far", mesh_apply.Action.RECONNECT)])
+
+    def test_a_reboot_that_does_not_help_stops_instead_of_repeating(self):
+        fake   = FakeMesh({"gateway": GATEWAY_B, "ap-hall": HALL_B, "ap-far": FAR_PINNED_HALL})
+        status = mesh_apply.run(chain(), runner(fake))
+
+        self.assertEqual(status, client.ExitStatus.NEEDS_ACTION)
+        self.assertEqual(fake.actions, [("ap-far", mesh_apply.Action.RECONNECT)])
+
+    def test_perform_passes_the_parent(self):
+        fake = FakeMesh({"gateway": GATEWAY_B, "ap-hall": HALL_B, "ap-far": FAR_PINNED_ROOT})
+        step = mesh_apply.decide(chain(), chain().node("ap-far"), fake.observe())
+        ok   = client.RemoteRun(target=None, returncode=0, stdout="", stderr="", seconds=0.1)
+
+        with mock.patch.object(client, "run_ssh", return_value=ok) as run_ssh:
+            self.assertEqual(mesh_apply.perform(step, chain(), b"script"), "")
+
+        remote = run_ssh.call_args.args[1]
+        self.assertIn(f"--role leaf --channel 1 --parent {HALL_BASE}", remote)
 
 
 class TestRun(unittest.TestCase):
