@@ -95,7 +95,7 @@ ssh-copy-id -i ~/.ssh/unifi_rsa.pub root@<gateway-ip>
 ```
 
 `ssh-copy-id` logs in with the password one last time and appends your public key to the
-gateway's `~/.ssh/authorized_keys`. It survives reboots and, on the Express 7 tested, firmware
+gateway's `~/.ssh/authorized_keys`. It survives reboots and, on the UniFi OS gateway tested, firmware
 updates. If `ssh gateway` ever asks for a password again, re-run the command.
 
 ### 4. Tell ssh which key and user to use
@@ -272,16 +272,22 @@ and every 5 minutes after that. Because `apply` changes nothing when the 2.4 GHz
 live, a run that finds nothing wrong does nothing. At boot the gateway's radio manager is still
 applying its own config and refuses changes, so `apply` waits (up to 2 minutes) for it to go idle
 first; if a change still fails, nothing is left half-done and the next run tries again. It also
-keeps a copy of root's `authorized_keys` and puts back any key a firmware update removes.
+keeps a copy of root's `authorized_keys` and puts back any key that goes missing. That copy is taken
+at install, so **after removing a key from the gateway's root, run `--install-self-heal` again**, or
+self-heal will put the key back.
 
 | On the gateway | What it is |
 |---|---|
 | `/data/unifi-overhaul/` | A copy of the script, the channel, and the key snapshot. `/data` survives firmware updates |
-| `/etc/systemd/system/unifi-overhaul-heal.{service,timer}` | The timer. UniFi OS keeps its root filesystem's changes across firmware updates on the Express 7 tested, so these should survive one. A factory reset removes everything |
+| `/etc/systemd/system/unifi-overhaul-heal.{service,timer}` | The timer. UniFi OS keeps its root filesystem's changes across firmware updates on the UniFi OS gateway tested, so these should survive one. A factory reset removes everything |
 
 The map shows its state on the gateway's line (`[self-heal: active]`). Check it after the
 gateway's next reboot, and after a firmware update, to confirm the timer survived; if it shows
 `not installed`, run `--install-self-heal` again. Its log: `journalctl -u unifi-overhaul-heal`.
+
+When you update the repo, `--apply` notices if the gateway's copy of the script is out of date and
+replaces it (it lists this in the plan first). It only does that when self-heal is installed; it never
+installs it.
 `--remove-self-heal` deletes exactly the files above. If anything else has ended up in
 `/data/unifi-overhaul/`, it leaves the folder and says so.
 

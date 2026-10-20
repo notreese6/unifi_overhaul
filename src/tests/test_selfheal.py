@@ -55,7 +55,7 @@ class TestSelfHeal(unittest.TestCase):
     def test_remote_dir_matches_the_script_default(self):
         with open(client.DEFAULT_SCRIPT, encoding="utf-8") as handle:
             default = re.search(r"HEAL_DIR=\$\{UNIFI_OVERHAUL_DATA:-([^}]+)\}", handle.read()).group(1)
-        self.assertEqual(selfheal.REMOTE_HEAL_DIR, default)
+        self.assertEqual(client.REMOTE_HEAL_DIR, default)
 
     def test_install_copies_the_script_then_installs_on_the_root(self):
         with mock.patch.object(client, "run_ssh", return_value=ok_run()) as run_ssh:
@@ -64,7 +64,7 @@ class TestSelfHeal(unittest.TestCase):
         target, remote, stdin = run_ssh.call_args.args[:3]
         self.assertEqual(status, client.ExitStatus.ALL_LIVE)
         self.assertEqual(target.ssh_target, "root@192.0.2.1")
-        self.assertIn(f"cat > {selfheal.REMOTE_HEAL_DIR}/unifi-overhaul.sh", remote)
+        self.assertIn(f"cat > {client.REMOTE_HEAL_DIR}/unifi-overhaul.sh", remote)
         self.assertTrue(remote.endswith("__install --channel 6"))
         self.assertEqual(stdin, b"#!/bin/sh\n")
 

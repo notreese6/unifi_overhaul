@@ -3,6 +3,7 @@ The gateway self-heal modes of unifi-overhaul.sh (__install, __heal, __remove, a
 temporary directories, a fake systemctl and a fake radio, so nothing on the test machine is touched.
 """
 
+import hashlib
 import os
 import shutil
 import subprocess
@@ -150,6 +151,11 @@ class TestSelfHealScript(unittest.TestCase):
         self.assertIn("S absent", self.run_script("__probe"))
         self.run_script("__install")
         self.assertIn("S active", self.run_script("__probe"))
+
+    def test_probe_reports_the_copys_checksum(self):
+        with open(os.path.join(self.heal_dir, "unifi-overhaul.sh"), "rb") as handle:
+            expected = hashlib.sha256(handle.read()).hexdigest()
+        self.assertIn(f"C {expected}", self.run_script("__probe"))
 
     def test_remove_deletes_only_what_install_made(self):
         self.run_script("__install")

@@ -7,6 +7,7 @@ the devices below it half-changed.
 from __future__ import annotations
 
 import enum
+import hashlib
 import sys
 import time
 from dataclasses import dataclass
@@ -279,6 +280,53 @@ def perform(step, topology, script):
     return ""
 
 
+def is_self_heal_stale(topology, observation, checksum):
+    """
+    Whether the gateway has self-heal installed with a copy of the script that differs from the local one.
+
+    Args:
+        topology (topology.Topology): the intended mesh (its root is the gateway).
+        observation (Observation): the live state.
+        checksum (str): sha256 of the local unifi-overhaul.sh.
+
+    Returns:
+        bool: True only when self-heal is installed and its copy's checksum is known and different.
+
+    Raises:
+        None
+    """
+
+    gateway = observation.devices[topology.ordered()[0].name]
+    # Never installs it: a gateway without self-heal, or one whose probe can't checksum, is left alone
+    is_installed = gateway.is_reachable and gateway.self_heal in ["active", "inactive"]
+    return is_installed and bool(gateway.heal_checksum) and gateway.heal_checksum != checksum
+
+
+def refresh_self_heal(node, script):
+    """
+    Replace the gateway's self-heal copy of unifi-overhaul.sh; the timer picks it up on its next run.
+
+    Args:
+        node (topology.Node): the gateway.
+        script (bytes): the contents of the local unifi-overhaul.sh.
+
+    Returns:
+        str: "" when replaced, otherwise why it couldn't be.
+
+    Raises:
+        OSError: ssh can't be executed.
+    """
+
+    path   = f"{client.REMOTE_HEAL_DIR}/unifi-overhaul.sh"
+    # Written beside it, then renamed over it, so a timer run never reads a half-written script
+    remote = f"cat > {path}.new && mv -f {path}.new {path}"
+    run    = client.run_ssh(target_for(node), remote, script, timeout=SSH_ACTION_TIMEOUT)
+    if run.returncode != 0:
+        reason = run.stderr.strip().splitlines()
+        return reason[-1] if reason else f"ssh exited {run.returncode}"
+    return ""
+
+
 @dataclass
 class Runner:
     """
@@ -291,6 +339,8 @@ class Runner:
     sleep:      object = time.sleep
     clock:      object = time.monotonic
     poll:       float  = POLL_SECONDS
+    refresh:    object = None          # (Node) -> str: replace the gateway's self-heal copy; None = never
+    checksum:   str    = ""            # sha256 of the local unifi-overhaul.sh, to compare that copy against
 
     def wait_for(self, topology, node, is_done, timeout):
         """
@@ -418,32 +468,47 @@ def run(topology, runner, is_confirmed=False):
         is_confirmed (bool): skip the confirmation prompt (--yes).
 
     Returns:
-        client.ExitStatus: ALL_LIVE when the mesh matches mesh.ini, NEEDS_ACTION when the run stopped,
-        NOT_RUN when the plan was declined.
+        client.ExitStatus: ALL_LIVE when the mesh matches mesh.ini, NEEDS_ACTION when the run stopped or the
+        self-heal copy couldn't be refreshed, NOT_RUN when the plan was declined.
 
     Raises:
         OSError: ssh can't be executed.
     """
 
-    steps = plan(topology, runner.observe())
-    print_plan(steps)
+    observation   = runner.observe()
+    steps         = plan(topology, observation)
+    root          = topology.ordered()[0]
+    needs_refresh = runner.refresh is not None and is_self_heal_stale(topology, observation, runner.checksum)
 
-    if all(step.action is Action.NONE for step in steps):
+    print_plan(steps)
+    if needs_refresh:
+        print(f"      {root.name}: refresh self-heal -- its copy of unifi-overhaul.sh differs from this one")
+
+    if all(step.action is Action.NONE for step in steps) and not needs_refresh:
         print("[+] the mesh already matches mesh.ini")
         return client.ExitStatus.ALL_LIVE
     if not is_confirmed and not runner.confirm("Make these changes?"):
         print("[*] nothing changed")
         return client.ExitStatus.NOT_RUN
 
+    status = client.ExitStatus.ALL_LIVE
+    if needs_refresh:
+        failure = runner.refresh(root)
+        if failure:
+            print(f"[-] couldn't refresh self-heal on {root.name}: {failure}", file=sys.stderr)
+            status = client.ExitStatus.NEEDS_ACTION
+        else:
+            print(f"[+] {root.name}: self-heal now runs this version of unifi-overhaul.sh")
+
     for node in topology.ordered():
         # Re-decided now rather than taken from the plan: fixing a parent changes what its children need
         step   = decide(topology, node, runner.observe())
-        status = settle(runner, topology, node, step)
-        if status is not None:
-            return status
+        stopped = settle(runner, topology, node, step)
+        if stopped is not None:
+            return stopped
 
     print("[+] the mesh matches mesh.ini")
-    return client.ExitStatus.ALL_LIVE
+    return status
 
 
 def ask(question):
@@ -484,4 +549,6 @@ def default_runner(topology, script):
 
     return Runner(observe=lambda: observe(topology, script),
                   perform=lambda step: perform(step, topology, script),
-                  confirm=ask)
+                  confirm=ask,
+                  refresh=lambda node: refresh_self_heal(node, script),
+                  checksum=hashlib.sha256(script).hexdigest())

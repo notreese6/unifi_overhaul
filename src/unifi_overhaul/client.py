@@ -113,6 +113,8 @@ DEFAULT_LOG_NAME    = "unifi-diagnostics-%Y%m%d-%H%M%S.log"
 INTERNET_HOST       = "1.1.1.1"
 REDACTED            = "<redacted>"
 REMOTE_SCRIPT       = "/tmp/unifi-overhaul.sh"
+# Must match HEAL_DIR's default in unifi-overhaul.sh (a test checks they agree): self-heal's copy of the script
+REMOTE_HEAL_DIR     = "/data/unifi-overhaul"
 
 # This file is src/unifi_overhaul/client.py, so the repo root is three levels up
 REPO_ROOT      = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -296,6 +298,7 @@ class Device:
     self_heal:     str = ""         # gateway self-heal timer: active / inactive / absent; "" = not reported
     base_mac:      str = ""         # the device's own MAC, as the controller and mesh.serial1 name it
     prefers:       str = ""         # base MAC of the parent its config prefers (mesh.serial1); "" = none set
+    heal_checksum: str = ""         # sha256 of the gateway's self-heal copy of the script; "" = none
     error:         str = ""
 
     @property
@@ -818,6 +821,8 @@ def parse_probe(target, output):
             dev.base_mac = fields[1].lower()
         elif kind == "P" and len(fields) >= 2:
             dev.prefers = fields[1].lower()
+        elif kind == "C" and len(fields) >= 2:
+            dev.heal_checksum = fields[1]
 
     # The uplink BSSID has to match the AP MACs case-for-case to join the tree
     dev.uplink = dev.uplink.lower() if dev.uplink not in ("WIRED", "NONE") else dev.uplink

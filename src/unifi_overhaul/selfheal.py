@@ -10,9 +10,7 @@ import sys
 from unifi_overhaul import apply as mesh_apply
 from unifi_overhaul import client
 
-# Must match HEAL_DIR's default in unifi-overhaul.sh (a test checks they agree): the install copies the script here
-REMOTE_HEAL_DIR = "/data/unifi-overhaul"
-SSH_TIMEOUT     = 60
+SSH_TIMEOUT = 60
 
 
 def gateway(topology):
@@ -76,13 +74,13 @@ def install(topology, script, confirm, is_confirmed=False):
 
     root = gateway(topology)
     print(f"[*] self-heal on {root.name}: re-applies 2.4 GHz (channel {topology.channel}) 90s after every boot and "
-          f"every 5 minutes, and restores root's ssh keys. Files: {REMOTE_HEAL_DIR}/ and two systemd units.")
+          f"every 5 minutes, and restores root's ssh keys. Files: {client.REMOTE_HEAL_DIR}/ and two systemd units.")
     if not is_confirmed and not confirm(f"Install it on {root.name}?"):
         print("[*] nothing changed")
         return client.ExitStatus.NOT_RUN
 
-    script_path = f"{REMOTE_HEAL_DIR}/unifi-overhaul.sh"
-    remote      = (f"mkdir -p {REMOTE_HEAL_DIR} && cat > {script_path} && "
+    script_path = f"{client.REMOTE_HEAL_DIR}/unifi-overhaul.sh"
+    remote      = (f"mkdir -p {client.REMOTE_HEAL_DIR} && cat > {script_path} && "
                    f"sh {script_path} __install --channel {topology.channel}")
     run         = client.run_ssh(mesh_apply.target_for(root), remote, script, timeout=SSH_TIMEOUT)
     return report(run, f"install self-heal on {root.name}")

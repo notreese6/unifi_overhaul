@@ -161,13 +161,15 @@ FAR_PINNED_HALL  = FAR_UNDER_ROOT + f"\nB 02:00:00:00:03:00\nP {HALL_BASE}"
 FAR_HOME         = FAR_UNDER_HALL + f"\nB 02:00:00:00:03:00\nP {HALL_BASE}"
 
 
-def runner(fake, answer=True):
+def runner(fake, answer=True, refresh=None, checksum=""):
     """
     A Runner wired to a FakeMesh, a fake clock, and a fixed answer to the confirmation.
 
     Args:
         fake (FakeMesh): the mesh.
         answer (bool): what the confirmation prompt returns.
+        refresh (callable | None): stands in for refreshing the gateway's self-heal copy; None = never.
+        checksum (str): the local script's checksum to compare that copy against.
 
     Returns:
         mesh_apply.Runner: the runner (its `asked` list records each question).
@@ -184,7 +186,7 @@ def runner(fake, answer=True):
         return answer
 
     built       = mesh_apply.Runner(observe=fake.observe, perform=fake.perform, confirm=confirm, sleep=clock.sleep,
-                                    clock=lambda: clock.now)
+                                    clock=lambda: clock.now, refresh=refresh, checksum=checksum)
     built.asked = asked
     return built
 
@@ -266,6 +268,68 @@ class TestPinning(unittest.TestCase):
 
         remote = run_ssh.call_args.args[1]
         self.assertIn(f"--role leaf --channel 1 --parent {HALL_BASE}", remote)
+
+
+class TestSelfHealRefresh(unittest.TestCase):
+    """
+    --apply refreshes the gateway's self-heal copy only when self-heal is installed and the copy is out of date.
+    """
+
+    def run_with(self, gateway_probe, checksum="new", failure=""):
+        """
+        Run --apply over a mesh that otherwise matches, recording refreshes.
+
+        Args:
+            gateway_probe (str): the gateway's __probe output.
+            checksum (str): the local script's checksum.
+            failure (str): what the refresh returns ("" = it worked).
+
+        Returns:
+            tuple[client.ExitStatus, list, FakeMesh]: the status, the nodes refreshed, and the mesh.
+
+        Raises:
+            None
+        """
+
+        refreshed = []
+
+        def refresh(node):
+            refreshed.append(node.name)
+            return failure
+
+        fake   = FakeMesh({"gateway": gateway_probe, "ap-hall": HALL_RELAY, "ap-far": FAR_UNDER_HALL})
+        status = mesh_apply.run(chain(), runner(fake, refresh=refresh, checksum=checksum))
+        return status, refreshed, fake
+
+    def test_stale_copy_is_refreshed(self):
+        status, refreshed, fake = self.run_with(GATEWAY_LIVE + "\nS active\nC old")
+        self.assertEqual((status, refreshed, fake.actions), (client.ExitStatus.ALL_LIVE, ["gateway"], []))
+
+    def test_current_copy_is_left_alone(self):
+        status, refreshed, _fake = self.run_with(GATEWAY_LIVE + "\nS active\nC new")
+        self.assertEqual((status, refreshed), (client.ExitStatus.ALL_LIVE, []))
+
+    def test_never_installs_it(self):
+        # No timer, but an old copy still in /data (e.g. the units were removed by hand): still not ours to touch
+        _status, refreshed, _fake = self.run_with(GATEWAY_LIVE + "\nS absent\nC old")
+        self.assertEqual(refreshed, [])
+
+    def test_unknown_checksum_is_left_alone(self):
+        _status, refreshed, _fake = self.run_with(GATEWAY_LIVE + "\nS active\nC ")
+        self.assertEqual(refreshed, [])
+
+    def test_failed_refresh_still_fixes_the_mesh_and_reports_it(self):
+        status, refreshed, _fake = self.run_with(GATEWAY_LIVE + "\nS active\nC old", failure="Permission denied")
+        self.assertEqual((status, refreshed), (client.ExitStatus.NEEDS_ACTION, ["gateway"]))
+
+    def test_refresh_replaces_the_file_atomically(self):
+        ok = client.RemoteRun(target=None, returncode=0, stdout="", stderr="", seconds=0.1)
+        with mock.patch.object(client, "run_ssh", return_value=ok) as run_ssh:
+            self.assertEqual(mesh_apply.refresh_self_heal(chain().node("gateway"), b"script"), "")
+
+        target, remote, stdin = run_ssh.call_args.args[:3]
+        path = f"{client.REMOTE_HEAL_DIR}/unifi-overhaul.sh"
+        self.assertEqual((target.ssh_target, remote, stdin), ("root@192.0.2.1", f"cat > {path}.new && mv -f {path}.new {path}", b"script"))
 
 
 class TestRun(unittest.TestCase):

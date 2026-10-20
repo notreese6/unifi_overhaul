@@ -126,6 +126,8 @@ do_probe(){   # machine-readable one-device summary for unifi-overhaul-client (r
   w=$(iw phy 2>/dev/null | grep -c "^Wiphy"); [ "$w" -gt 0 ] || w=$(ls -d /sys/class/net/wifi[0-9] 2>/dev/null | wc -l)
   echo "W $w"
   echo "S $(heal_state)"
+  # Checksum of self-heal's copy of this script, so the client can tell when it's out of date ("" = none)
+  echo "C $(sha256sum "$HEAL_DIR/unifi-overhaul.sh" 2>/dev/null | cut -d' ' -f1)"
   # Base MAC, and the parent this device's config prefers (mesh.serial1, which the uplink choice weighs)
   echo "B $(awk -F= '/^hwaddrbbase=/{print $2}' "$BOARD" 2>/dev/null | tr A-F a-f)"
   echo "P $(val mesh.serial1 "$CFG" 2>/dev/null | tr A-F a-f)"
